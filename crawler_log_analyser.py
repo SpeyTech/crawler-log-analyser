@@ -19,13 +19,13 @@ Usage:
 
 No external dependencies required.
 
-Version: 1.4.0
+Version: 1.4.1
 Author: William Murray, SpeyTech
 """
 
 from __future__ import annotations
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 import argparse
 import gzip
@@ -695,16 +695,25 @@ class Aggregate:
     # is not worth the code complexity for this workload.
     slowest_entries: list[LogEntry] = field(default_factory=list)
 
-    # Per-path redirect attribution. For each redirected path, count
-    # observed origin signatures. Origins:
+    # Per-bot, per-path redirect attribution. For each (bot, path) pair,
+    # count observed origin signatures so the attribution numbers
+    # reconcile with the per-bot redirect count next to them. Origins:
     #   - "http_to_https": scheme=http and the target was https
     #   - "www_to_apex":   host started with "www." and the apex was likely the target
     #   - "trailing_slash": path didn't end with "/" (best-effort, host/scheme alone don't prove it)
     #   - "canonical_loop": the request was already on the canonical host/scheme
     #                       (a config bug — flagged CRITICAL in §5.1)
     #   - "other":          fallback bucket so totals reconcile with §5.1
-    redirect_attribution: dict[str, Counter[str]] = field(
-        default_factory=lambda: defaultdict(Counter)
+    #
+    # Structure: redirect_attribution[bot][path] = Counter({cause: count}).
+    # v1.4.0 keyed this by path alone, which caused per-bot attribution
+    # rows to display the aggregate cause-count across all bots — a real
+    # bug (e.g. "6 × /" labelled "(5 HTTP→HTTPS, 4 www→apex)" because
+    # the 9 was the site-wide count, not Googlebot's portion). v1.4.1
+    # fixes this by keying attribution per-bot so each row's numbers
+    # match the redirect count alongside them.
+    redirect_attribution: dict[str, dict[str, Counter[str]]] = field(
+        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
     )
 
 
@@ -782,7 +791,7 @@ def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
             # the source URL.
             if e.host is not None and e.scheme is not None:
                 cause = _classify_redirect_cause(e.scheme, e.host, e.path)
-                agg.redirect_attribution[e.path][cause] += 1
+                agg.redirect_attribution[e.bot][e.path][cause] += 1
 
         # v1.3: latency tracking from seo_crawl format.
         if e.request_time is not None:
@@ -1216,7 +1225,7 @@ def render_redirects(agg: Aggregate, fmt: str) -> str:
         any_redirects = True
         out.append(f"\n{bot}: {total} redirects")
         for path, count in paths.most_common(10):
-            note, critical = _redirect_note(path, agg)
+            note, critical = _redirect_note(bot, path, agg)
             prefix = "  [CRITICAL] " if critical else "  "
             out.append(f"{prefix}{count:>3} × {path}{note}")
     if not any_redirects:
@@ -1224,19 +1233,23 @@ def render_redirects(agg: Aggregate, fmt: str) -> str:
     return "\n".join(out) + "\n"
 
 
-def _redirect_note(path: str, agg: Aggregate) -> tuple[str, bool]:
-    """Return (annotation, is_critical) for a redirect path.
+def _redirect_note(bot: str, path: str, agg: Aggregate) -> tuple[str, bool]:
+    """Return (annotation, is_critical) for a redirect path for a given bot.
 
-    When seo_crawl data is available for this path, the annotation lists
-    the observed causes with counts (e.g. "(1 HTTP→HTTPS, 1 www→apex)").
-    is_critical is True if any of the observed causes is "canonical_loop",
-    which indicates a redirect on the canonical URL itself — a real
-    configuration bug per spec §5.1.
+    When seo_crawl data is available for this (bot, path) pair, the
+    annotation lists the observed causes with counts (e.g.
+    "(1 HTTP→HTTPS, 1 www→apex)"). is_critical is True if any of the
+    observed causes is "canonical_loop", which indicates a redirect on
+    the canonical URL itself — a real configuration bug per spec §5.1.
 
-    When no seo_crawl data is available, the original v1.2 heuristic note
-    is used so combined-format output remains byte-identical.
+    The attribution lookup is per-bot (v1.4.1), so the cause-count
+    annotation reconciles with the per-bot redirect count alongside it.
+
+    When no seo_crawl data is available, the original v1.2 heuristic
+    note is used so combined-format output remains byte-identical.
     """
-    attribution = agg.redirect_attribution.get(path)
+    bot_attribution = agg.redirect_attribution.get(bot)
+    attribution = bot_attribution.get(path) if bot_attribution else None
     if attribution:
         # Render in a fixed, human-friendly order so the same data always
         # produces the same string. The order also matches the JSON keys
@@ -1297,10 +1310,10 @@ def render_response_latency(agg: Aggregate, fmt: str) -> str:
 
     out.append("Overall:")
     out.append(
-        f"  median: {percentiles['median']:.3f}s    "
-        f"p75: {percentiles['p75']:.3f}s    "
-        f"p95: {percentiles['p95']:.3f}s    "
-        f"p99: {percentiles['p99']:.3f}s"
+        f"  median: {_fmt_latency(percentiles['median'])}    "
+        f"p75: {_fmt_latency(percentiles['p75'])}    "
+        f"p95: {_fmt_latency(percentiles['p95'])}    "
+        f"p99: {_fmt_latency(percentiles['p99'])}"
     )
 
     # Per-bot medians for the top 5 most-active bots that have timing data.
@@ -1320,7 +1333,7 @@ def render_response_latency(agg: Aggregate, fmt: str) -> str:
         for bot, _ in top_bots:
             samples = agg.request_times_by_bot[bot]
             med = statistics.median(samples)
-            out.append(f"  {bot + ':':<{width + 1}} {med:.3f}s")
+            out.append(f"  {bot + ':':<{width + 1}} {_fmt_latency(med)}")
 
     # Top 10 slowest individual requests. agg.slowest_entries is already
     # sorted descending and trimmed to 10 by aggregate().
@@ -1330,7 +1343,13 @@ def render_response_latency(agg: Aggregate, fmt: str) -> str:
         for rank, e in enumerate(agg.slowest_entries, 1):
             rt = e.request_time if e.request_time is not None else 0.0
             ut = f"{e.upstream_time:.3f}s" if e.upstream_time is not None else "-"
-            path_display = e.path if len(e.path) <= 30 else e.path[:29] + "…"
+            # v1.4.1: render empty path as a clear placeholder rather
+            # than a blank column. Empty paths come from probe traffic
+            # with unusual request lines (e.g. "GET // HTTP/1.1") where
+            # the parser tolerated the shape but path normalisation
+            # produced an empty string.
+            raw_path = e.path if e.path else "(empty)"
+            path_display = raw_path if len(raw_path) <= 30 else raw_path[:29] + "…"
             bot_display = e.bot if len(e.bot) <= 18 else e.bot[:17] + "…"
             ts_display = e.ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             out.append(
@@ -1339,6 +1358,22 @@ def render_response_latency(agg: Aggregate, fmt: str) -> str:
             )
 
     return "\n".join(out) + "\n"
+
+
+def _fmt_latency(seconds: float) -> str:
+    """Render a latency value with honest precision at low scales.
+
+    Values under 1ms render as "<1ms" rather than "0.000s" — the latter
+    reads as "zero latency" when in practice it just means "below the
+    millisecond display threshold." This matters on fast static sites
+    where percentiles legitimately round to sub-millisecond but slow
+    outliers are still present in the data; rendering both as 0.000s
+    misleads readers into thinking the slowest-10 list contradicts the
+    percentile summary.
+    """
+    if seconds < 0.001:
+        return "<1ms"
+    return f"{seconds:.3f}s"
 
 
 def render_health_score(agg: Aggregate, fmt: str,
@@ -1820,17 +1855,26 @@ def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None
         }
 
     if agg.redirect_attribution:
-        # Per §5.4, every path includes all four canonical keys plus "other"
-        # if it was used. Missing causes are emitted as 0 so consumers can
-        # rely on a stable shape without conditional lookups.
-        attribution_payload: dict[str, dict[str, int]] = {}
+        # v1.4.1: emit per-bot, per-path attribution so the JSON
+        # reconciles with the per-bot redirect counts in the "redirects"
+        # key. Previous shape was {path: causes}, which lost the
+        # per-bot dimension. New shape is {bot: {path: causes}}.
+        # Every (bot, path) pair includes all four canonical keys plus
+        # "other" if it was used. Missing causes are emitted as 0 so
+        # consumers can rely on a stable inner shape without conditional
+        # lookups.
+        attribution_payload: dict[str, dict[str, dict[str, int]]] = {}
         canonical_keys = ("http_to_https", "www_to_apex",
                           "trailing_slash", "canonical_loop")
-        for path, causes in agg.redirect_attribution.items():
-            row: dict[str, int] = {k: causes.get(k, 0) for k in canonical_keys}
-            if causes.get("other"):
-                row["other"] = causes["other"]
-            attribution_payload[path] = row
+        for bot, by_path in agg.redirect_attribution.items():
+            bot_payload: dict[str, dict[str, int]] = {}
+            for path, causes in by_path.items():
+                row: dict[str, int] = {k: causes.get(k, 0) for k in canonical_keys}
+                if causes.get("other"):
+                    row["other"] = causes["other"]
+                bot_payload[path] = row
+            if bot_payload:
+                attribution_payload[bot] = bot_payload
         payload["redirect_attribution"] = attribution_payload
 
     return json.dumps(payload, indent=2, sort_keys=True, default=str)

@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## v1.4.1 — 2026-05-11
+
+Bug fixes for two issues surfaced by real-traffic review of the May 11
+morning report on speytech.com.
+
+### Fixed
+
+- **Redirect attribution numbers now reconcile per-bot.** v1.3 introduced
+  per-path redirect attribution but keyed the attribution counter by
+  path alone, while the redirect count next to it was per-bot. Effect:
+  a row like `6 × /` for Googlebot displayed `(5 HTTP→HTTPS, 4 www→apex)`
+  — totalling 9 because it was the site-wide sum across all bots that
+  hit `/`, not Googlebot's six. The attribution is now keyed
+  `[bot][path][cause]` so cause-counts sum to the redirect count
+  alongside them.
+
+  Verified against the May 11 seo log: every bot/path row now
+  reconciles. The site-wide attribution remains available by summing
+  across bots in the JSON output.
+
+- **Sub-millisecond latency percentiles now render as `<1ms` rather
+  than `0.000s`.** When percentiles round below the millisecond display
+  threshold but the slowest-N list contains higher-latency outliers,
+  the previous rendering read as a contradiction: "p99 is zero but the
+  slowest request took 184ms." The new helper renders any value below
+  1ms as `<1ms`, which is honest about the display threshold without
+  implying zero latency.
+
+- **Empty paths in the slowest-N list now render as `(empty)` instead
+  of a blank column.** Empty paths arise from probe traffic with
+  unusual request shapes (e.g. `GET // HTTP/1.1`). The blank column
+  was visually confusing.
+
+### Schema change (minor, additive)
+
+- The JSON `redirect_attribution` payload changes shape from
+  `{path: {cause: count}}` to `{bot: {path: {cause: count}}}`. Consumers
+  that aggregated per-path attribution previously can sum across the
+  bot dimension to recover the old shape:
+  ```python
+  per_path = collections.Counter()
+  for bot, paths in data["redirect_attribution"].items():
+      for path, causes in paths.items():
+          for cause, n in causes.items():
+              per_path[(path, cause)] += n
+  ```
+  The new shape is structurally correct and matches the text/markdown
+  rendering.
+
+### Preserved
+
+- Combined-format output remains byte-identical to v1.3 and v1.4.0.
+  The fixes only affect output when seo_crawl data is present — which
+  is the only context where redirect attribution and per-request
+  latency are populated.
+- All CLI flags, exit codes, and the strict-mode contract are unchanged.
+
+### Verification
+
+Tested against speytech.com seo log (1,190 lines, 854 crawler requests,
+197 redirects across 9 bots). Every redirect row reconciles; latency
+section now reads honestly; empty-path probe row renders cleanly.
+
 ## v1.4.0 — 2026-05-11
 
 Classifier accuracy improvements driven by real-traffic measurement against
