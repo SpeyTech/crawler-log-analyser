@@ -19,13 +19,13 @@ Usage:
 
 No external dependencies required.
 
-Version: 1.3.0
+Version: 1.4.0
 Author: William Murray, SpeyTech
 """
 
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import argparse
 import gzip
@@ -47,6 +47,18 @@ from typing import Iterable, Iterator
 
 # Bot classification rules. Order matters: more specific patterns first.
 # Each tuple is (display_name, regex_pattern, is_ai_crawler).
+# Bot user-agent patterns, evaluated in order. First match wins, so more
+# specific patterns must come before more general ones (Googlebot-Image
+# before Googlebot, named bots before the GenericBot catch-all).
+#
+# The third tuple field, is_ai, controls whether the bot is counted in the
+# AI Crawler Report and weighted in the search-crawler health score. The
+# distinction is operational: AI crawlers signal LLM-driven discovery and
+# warrant separate visibility from traditional search-index crawlers.
+#
+# When adding new patterns, run them against a recent production log via
+# the seo_crawl fixture in v1.4-ticket.md before committing. Empty-UA
+# requests short-circuit before this list and are handled separately.
 BOT_PATTERNS: list[tuple[str, str, bool]] = [
     ("Googlebot-Image",     r"Googlebot-Image",                    False),
     ("Googlebot",           r"Googlebot",                          False),
@@ -70,6 +82,15 @@ BOT_PATTERNS: list[tuple[str, str, bool]] = [
     ("BaiduSpider",         r"Baiduspider",                        False),
     ("LinkedInBot",         r"LinkedInBot",                        False),
     ("TwitterBot",          r"Twitterbot",                         False),
+    ("Amazonbot",           r"Amazonbot",                          True),
+    ("PetalBot",            r"PetalBot",                           False),
+    ("SleepBot",            r"SleepBot",                           True),
+    ("TikTokSpider",        r"TikTokSpider",                       True),
+    # RSS readers. Neither search nor AI; they represent direct
+    # subscriber-driven polling. Worth counting but not weighted in the
+    # AI crawler report or search-crawler health score (is_ai=False).
+    ("News Explorer",       r"News Explorer",                      False),
+    ("Feedly",              r"Feedly",                             False),
     # Generic catch-alls last.
     ("GenericBot",          r"\bbot\b|crawler|spider|slurp",       False),
 ]
@@ -357,7 +378,14 @@ def open_log(path: Path) -> io.TextIOBase:
 def classify_bot(ua: str) -> tuple[str, bool]:
     """Return (bot_family, is_ai_crawler) for a user-agent string."""
     if not ua or ua == "-":
-        return ("UnknownBot", False)
+        # v1.4: route empty-UA traffic to its own category rather than
+        # UnknownBot. Empty UAs are almost always either misconfigured
+        # scanners or exploit probes; the path-based is_security_probe
+        # detector will catch the exploit case downstream. Reporting
+        # these as "Empty-UA" rather than "UnknownBot" prevents the
+        # bot-breakdown from suggesting a fleet of mystery crawlers
+        # when the operational reality is usually one scanner IP.
+        return ("Empty-UA", False)
     for name, pattern, is_ai in BOT_PATTERNS:
         if re.search(pattern, ua, re.IGNORECASE):
             return (name, is_ai)

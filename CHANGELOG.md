@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## v1.4.0 — 2026-05-11
+
+Classifier accuracy improvements driven by real-traffic measurement against
+production seo log on speytech.com.
+
+### Changed
+
+- Empty user-agent (`-`) requests are now classified as `Empty-UA` rather
+  than `UnknownBot`. The previous classification suggested unknown-bot
+  activity when in practice empty-UA traffic is dominated by misconfigured
+  scanners and exploit probes. Empty-UA requests on PHP-exploit paths
+  continue to be aggregated in the Security Probes section, where they
+  belong operationally.
+
+  Operational evidence: the May 10 seo log showed 244 requests from a
+  single Azure IP (`4.228.184.28`) with empty UA, exclusively on
+  PHP-exploit paths. v1.3 reported these as `UnknownBot: 245`, which read
+  as "many unknown crawlers" when the operational reality was "one
+  scanner doing one shape of attack." v1.4 reports them as
+  `Empty-UA: 245` and surfaces the single-IP concentration in the
+  Security Probes summary.
+
+### Added
+
+- `TikTokSpider` classification (AI-family, social/recommendation surface).
+- `News Explorer` and `Feedly` classification (RSS readers, non-AI).
+  RSS readers represent direct subscriber-driven polling and are now
+  counted as their own category rather than disappearing into
+  `Human/Other`.
+- `Amazonbot`, `PetalBot`, `SleepBot` classification (added during
+  v1.3 → v1.4 development).
+
+### Notes
+
+- Bot-breakdown JSON consumers should update to recognise the new
+  `Empty-UA`, `News Explorer`, `Feedly`, and `TikTokSpider` categories.
+  The `UnknownBot` category remains in place for genuinely
+  unidentifiable bot-shaped UAs that the empty-UA short-circuit
+  doesn't catch.
+- This is a minor version bump because the bot-breakdown report
+  changes shape in a visible way. CLI flags, exit codes, and the
+  combined-format parser are unchanged.
+
+### Regression evidence
+
+The May 10 seo log (1,186 lines) reclassifies cleanly between v1.3 and
+v1.4 with no data loss:
+
+| Category | v1.3 | v1.4 | Change |
+|----------|------|------|--------|
+| Googlebot | 426 | 426 | — |
+| UnknownBot | 245 | 0 | removed |
+| Empty-UA | 0 | 245 | new (renamed from UnknownBot) |
+| News Explorer | 0 | 53 | newly classified |
+| ChatGPT-User | 28 | 28 | — |
+| PetalBot | 0 | 25 | newly classified |
+| AhrefsBot | 14 | 14 | — |
+| MJ12bot | 10 | 10 | — |
+| Amazonbot | 0 | 8 | newly classified |
+| Bingbot | 8 | 8 | — |
+| OAI-SearchBot | 7 | 7 | — |
+| YandexBot | 6 | 6 | — |
+| Applebot | 5 | 5 | — |
+| Feedly | 0 | 4 | newly classified |
+| Bytespider | 3 | 3 | — |
+| TikTokSpider | 0 | 3 | newly classified |
+| DuckDuckBot | 2 | 2 | — |
+| FacebookExternalHit | 2 | 2 | — |
+| GPTBot | 2 | 2 | — |
+| GenericBot | 3 | 0 | absorbed (was TikTokSpider) |
+| SleepBot | 0 | 1 | newly classified |
+
+Total crawler requests: 822 (v1.3 sum) → 822 (v1.4 sum). No data lost,
+no double-counting. Human/Other count is approximately 364 in both
+versions (residual from 1,186 total parsed lines minus crawler
+requests).
+
 ## v1.3.0 — 2026-05-10
 
 Added support for the nginx `seo_crawl` log format which includes `$host`,
