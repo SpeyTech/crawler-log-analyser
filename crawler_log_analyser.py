@@ -19,13 +19,13 @@ Usage:
 
 No external dependencies required.
 
-Version: 1.4.1
+Version: 1.5.0
 Author: William Murray, SpeyTech
 """
 
 from __future__ import annotations
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 import argparse
 import gzip
@@ -718,12 +718,21 @@ class Aggregate:
 
 
 def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
-              show_security_probes: bool) -> Aggregate:
+              show_security_probes: bool,
+              ignored_probe_ips: frozenset[str] = frozenset()) -> Aggregate:
     """Walk parsed entries and build the Aggregate snapshot.
 
     Security-probe traffic (PHP/WordPress/etc on a static Astro site) is
     summarised separately and suppressed from the main 404 list unless
     show_security_probes is True.
+
+    ignored_probe_ips (v1.5): source IPs whose probe-classified requests
+    are excluded from probe_count, probe_paths, and probe_ips. Used to
+    filter operator self-test traffic (e.g. curl tests from the host VM)
+    which otherwise inflates the probe-noise tally with internal traffic.
+    Bot statistics and health scores are unaffected — the ignored IPs
+    still contribute to every other aggregation, so the only visible
+    effect is a cleaner "Suppressed Security Probe Noise" section.
     """
     agg = Aggregate()
 
@@ -735,7 +744,11 @@ def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
             agg.latest = e.ts
 
         # Always track probe summary, regardless of suppression flag.
-        if e.is_probe:
+        # v1.5: skip probe tracking for ignored source IPs (e.g. operator
+        # self-tests from the host VM). The entry still flows through to
+        # all other classifications below — only the probe-noise tally
+        # excludes these IPs.
+        if e.is_probe and e.ip not in ignored_probe_ips:
             agg.probe_count += 1
             agg.probe_paths[e.path] += 1
             agg.probe_ips[e.ip] += 1
@@ -1264,7 +1277,18 @@ def _redirect_note(bot: str, path: str, agg: Aggregate) -> tuple[str, bool]:
         parts = [f"{attribution[k]} {label}"
                  for k, label in label_order if attribution.get(k)]
         note = f"  ({', '.join(parts)})" if parts else ""
-        critical = attribution.get("canonical_loop", 0) > 0
+        # v1.5: a true canonical loop (a configuration bug per spec §5.1)
+        # manifests as the same path being redirected repeatedly by the
+        # same crawler — Googlebot retries, gets redirected, retries again.
+        # Legacy path renames (e.g. /contact-us/ → /contact/ from a site
+        # rebranded years ago) produce a single redirect per crawler visit
+        # and should NOT be flagged CRITICAL.
+        #
+        # Heuristic: only flag CRITICAL when canonical_loop count >= 3.
+        # A genuine configuration bug easily exceeds this; legacy path
+        # renames stay in the single digits per crawler.
+        canonical_loop_count = attribution.get("canonical_loop", 0)
+        critical = canonical_loop_count >= 3
         return note, critical
 
     # Fallback: original v1.2 heuristic. Preserves byte-identical output
@@ -1930,6 +1954,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--show-security-probes", action="store_true",
                    help="Include exploit-probe traffic (PHP/WordPress/etc) in the 404 report. "
                         "By default these are summarised separately to keep SEO output readable.")
+    p.add_argument("--ignore-source-ip", action="append", default=[],
+                   dest="ignored_ips", metavar="IP",
+                   help="Source IP to exclude from probe classification. Pass once per IP "
+                        "(e.g. --ignore-source-ip 35.230.156.201). Typically used to filter "
+                        "operator self-test traffic from the daily probe-noise summary, "
+                        "since curl tests originating from the host server are otherwise "
+                        "indistinguishable from external scanner traffic. Does not affect "
+                        "bot statistics or health scores — only the probe-noise tally.")
     p.add_argument("--seo-only", action="store_true",
                    help="Aggressive SEO focus: hide probe summary entirely. Implies suppression "
                         "of security probes.")
@@ -2062,6 +2094,7 @@ def main(argv: list[str] | None = None) -> int:
         entries,
         include_non_bots=args.include_non_bots,
         show_security_probes=args.show_security_probes,
+        ignored_probe_ips=frozenset(args.ignored_ips),
     )
     agg.stats = stats
 
