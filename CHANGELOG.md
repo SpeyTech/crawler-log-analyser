@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+# v1.5.0 — 2026-05-13
+
+Two targeted operational improvements following two days of intensive use against the speytech.com production log. Both came directly from real findings in the daily analyser report rather than speculative feature work.
+
+## Added
+
+- **`--ignore-source-ip IP`** — exclude a source IP from probe-classification aggregation. Pass once per IP to filter multiple addresses. Typical use: filter operator self-test traffic from the host VM (e.g. `--ignore-source-ip 35.230.156.201`) so curl tests originating from the same server as nginx don't inflate the daily probe-noise summary. Does not affect bot statistics, health scores, or any other classification — only the "Suppressed Security Probe Noise" tally and its associated path/IP counters. Other entries from the ignored IPs still flow through to every other aggregation normally.
+
+## Changed
+
+- **Canonical-loop criticality threshold raised to count ≥ 3.** Previously, any redirect classified as `canonical_loop` was flagged `[CRITICAL]`. This produced false positives for legacy path renames (e.g. `/contact-us/` → `/contact/` from a site rebranded years before nginx was reconfigured) where a single crawler visit produces a single redirect.
+
+  A true configuration-bug canonical loop — the case the CRITICAL flag is designed to catch — manifests as the same crawler hitting the same path repeatedly, retrying after each redirect. Such loops easily exceed the new threshold. Single-digit canonical-loop counts almost always represent legacy path renames and now render without the CRITICAL prefix, though the `canonical-loop` classification label is preserved in the annotation so the underlying signal is still visible.
+
+  If a true low-count canonical loop ever needs to be flagged, the threshold can be lowered to 2 in `_redirect_note()`.
+
+## Operational notes
+
+The `--ignore-source-ip` flag was motivated by a recurring pattern in the daily reports: operator verification curls from Axioma (35.230.156.201) appearing in the probe-noise IP list, indistinguishable from external scanner traffic. Without filtering, every verification run that exercises `/api/csp-report.php` or similar inflates the probe count and skews the top-IP list. The flag does not exclude the operator IP from any other classification — Googlebot UA spoofing tests from the operator IP, for example, would still flow through to the Googlebot statistics correctly.
+
+The canonical-loop threshold change was motivated by `/contact-us/` showing as `[CRITICAL]` on every daily report despite being a benign legacy path rename. The fix preserves operational visibility (the classification label still appears) while removing the false-alarm severity that was causing the strict-mode exit code path to flag legitimate site states as critical.
+
+## Compatibility
+
+Both changes are backward compatible:
+
+- `--ignore-source-ip` is opt-in; existing invocations without the flag produce byte-identical output to v1.4.1 for the same input.
+- The canonical-loop threshold change affects output only when the underlying classifier already identified a canonical-loop case. For logs with no canonical-loop entries (the common case), output is byte-identical to v1.4.1.
+
+The JSON output schema is unchanged. The redirect attribution data structure still includes `canonical_loop` counts; only the rendering of the CRITICAL prefix changed.
+
+## Verified
+
+- Syntax validation via `ast.parse`
+- `--version` reports `1.5.0`
+- `--ignore-source-ip` filter verified end-to-end against production seo log: filtering one IP drops probe count from 368 to 124; filtering two drops to 39 (sums match per-IP probe contributions exactly)
+- Multi-flag composition (`--ignore-source-ip A --ignore-source-ip B`) works as expected via `action="append"`
+- No regression on existing test data: identical output structure for runs without the new flag
+
 ## v1.4.1 — 2026-05-11
 
 Bug fixes for two issues surfaced by real-traffic review of the May 11
