@@ -19,13 +19,13 @@ Usage:
 
 No external dependencies required.
 
-Version: 1.5.0
+Version: 1.6.0
 Author: William Murray, SpeyTech
 """
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import argparse
 import gzip
@@ -108,6 +108,21 @@ SPECIAL_FILES: list[str] = [
     "/llms.txt",
     "/llms-full.txt",
 ]
+
+# v1.6 canonical-loop severity thresholds. See _redirect_note() for the
+# full rationale. Calibrated empirically from 2026-05-11..05-13 production
+# data which showed working redirects routinely hitting counts of 11-22
+# from Googlebot revalidation after IndexNow pings.
+CANONICAL_LOOP_HIGH_TRAFFIC_THRESHOLD = 3   # >= this count: annotate as "high-traffic redirect"
+CANONICAL_LOOP_CRITICAL_THRESHOLD = 50      # >= this count: flag CRITICAL
+
+# v1.6 AI crawler depth-preference threshold. Used by the new
+# render_ai_crawler_depth_preference() subsection. A crawler's "full-content
+# ratio" is full_count / (full_count + index_count); 1.0 means it has only
+# ever fetched llms-full.txt, 0.0 means it has only ever fetched llms.txt.
+# "Exclusive" is determined by the other depth's count being zero (no
+# threshold needed); the ratio threshold separates "prefers" from "mixed".
+AI_DEPTH_PREFERENCE_RATIO = 0.75
 
 # URL category classifiers, evaluated top to bottom.
 URL_CATEGORIES: list[tuple[str, re.Pattern[str]]] = [
@@ -1251,15 +1266,36 @@ def _redirect_note(bot: str, path: str, agg: Aggregate) -> tuple[str, bool]:
 
     When seo_crawl data is available for this (bot, path) pair, the
     annotation lists the observed causes with counts (e.g.
-    "(1 HTTP→HTTPS, 1 www→apex)"). is_critical is True if any of the
-    observed causes is "canonical_loop", which indicates a redirect on
-    the canonical URL itself — a real configuration bug per spec §5.1.
+    "(1 HTTP→HTTPS, 1 www→apex)"). is_critical is True if the
+    canonical_loop cause count is >= CANONICAL_LOOP_CRITICAL_THRESHOLD,
+    which indicates a genuine configuration bug (per spec §5.1).
 
     The attribution lookup is per-bot (v1.4.1), so the cause-count
     annotation reconciles with the per-bot redirect count alongside it.
 
     When no seo_crawl data is available, the original v1.2 heuristic
     note is used so combined-format output remains byte-identical.
+
+    v1.6 severity calibration:
+        Two days of production data (2026-05-11..05-13) showed working
+        redirects routinely hitting counts of 11-22 from Googlebot
+        revalidation after IndexNow pings. The v1.5 threshold (>= 3)
+        was producing false CRITICAL flags for redirects that the
+        seo-validator section 21 confirmed were resolving cleanly.
+
+        v1.6 raises the CRITICAL threshold to >= 50 and adds a
+        "[high-traffic redirect]" annotation for the 3-49 range so the
+        operator still sees the volume without it triggering an
+        unwarranted CRITICAL flag.
+
+        A genuine configuration loop produces hundreds of retries on
+        the same path within a report period. The >= 50 threshold
+        comfortably separates working-redirect-at-scale from
+        configuration-loop, while remaining low enough to catch real
+        loops before they consume significant crawler budget.
+
+        Calibrated empirically; revisit if production data shows the
+        gap matters at lower counts.
     """
     bot_attribution = agg.redirect_attribution.get(bot)
     attribution = bot_attribution.get(path) if bot_attribution else None
@@ -1277,18 +1313,19 @@ def _redirect_note(bot: str, path: str, agg: Aggregate) -> tuple[str, bool]:
         parts = [f"{attribution[k]} {label}"
                  for k, label in label_order if attribution.get(k)]
         note = f"  ({', '.join(parts)})" if parts else ""
-        # v1.5: a true canonical loop (a configuration bug per spec §5.1)
-        # manifests as the same path being redirected repeatedly by the
-        # same crawler — Googlebot retries, gets redirected, retries again.
-        # Legacy path renames (e.g. /contact-us/ → /contact/ from a site
-        # rebranded years ago) produce a single redirect per crawler visit
-        # and should NOT be flagged CRITICAL.
-        #
-        # Heuristic: only flag CRITICAL when canonical_loop count >= 3.
-        # A genuine configuration bug easily exceeds this; legacy path
-        # renames stay in the single digits per crawler.
+
         canonical_loop_count = attribution.get("canonical_loop", 0)
-        critical = canonical_loop_count >= 3
+        critical = canonical_loop_count >= CANONICAL_LOOP_CRITICAL_THRESHOLD
+        # v1.6: annotate non-CRITICAL working redirects at scale so the
+        # operator sees the volume context. Threshold band:
+        #   1-2  : silent (legacy path rename, single visit)
+        #   3-49 : "[high-traffic redirect]" suffix (working redirect
+        #          revalidated heavily, e.g. post-IndexNow ping)
+        #   >=50 : CRITICAL (genuine configuration loop)
+        if (CANONICAL_LOOP_HIGH_TRAFFIC_THRESHOLD
+                <= canonical_loop_count
+                < CANONICAL_LOOP_CRITICAL_THRESHOLD):
+            note = f"{note} [high-traffic redirect]"
         return note, critical
 
     # Fallback: original v1.2 heuristic. Preserves byte-identical output
@@ -1441,7 +1478,101 @@ def render_ai_crawlers(agg: Aggregate, fmt: str, bot_filter: str) -> str:
         out.append(f"  404: {nf}, 5xx: {srv}")
     if not seen_any:
         out.append("No AI crawler activity recorded.")
+        return "\n".join(out) + "\n"
+
+    # v1.6: depth-preference subsection. Only renders AI crawlers that
+    # have fetched at least one of /llms.txt or /llms-full.txt. Crawlers
+    # that only hit /robots.txt belong in the main listing above; they
+    # don't carry a depth signal worth surfacing.
+    depth_lines = _render_ai_depth_preference(agg)
+    if depth_lines:
+        out.append("")
+        out.append("Content-depth preference (LLMs file fetches)")
+        out.extend(depth_lines)
+
     return "\n".join(out) + "\n"
+
+
+def _classify_ai_depth_preference(full_count: int, index_count: int) -> tuple[str, float | None]:
+    """Return (label, full_ratio) for an AI crawler's LLMs file fetches.
+
+    Used by both the text renderer and the JSON output so the two stay
+    in sync. full_ratio is None when there's insufficient data (single
+    fetch or both zero).
+    """
+    total = full_count + index_count
+    if total == 0:
+        return ("no data", None)
+    if total == 1:
+        return ("insufficient data", None)
+    if index_count == 0:
+        return ("exclusive: full-content", 1.0)
+    if full_count == 0:
+        return ("exclusive: index-only", 0.0)
+    full_ratio = full_count / total
+    if full_ratio >= AI_DEPTH_PREFERENCE_RATIO:
+        return (f"prefers full-content ({int(round(full_ratio * 100))}% full)", full_ratio)
+    if full_ratio <= (1 - AI_DEPTH_PREFERENCE_RATIO):
+        return (f"prefers index-only ({int(round((1 - full_ratio) * 100))}% index)", full_ratio)
+    return (
+        f"mixed ({int(round(full_ratio * 100))}% full, {int(round((1 - full_ratio) * 100))}% index)",
+        full_ratio,
+    )
+
+
+def _compute_ai_depth_preference_payload(agg: Aggregate) -> dict[str, dict[str, object]]:
+    """Return the structured AI crawler depth-preference data for JSON output.
+
+    Empty dict means "no AI crawler fetched any LLMs file" — caller
+    should omit the JSON key entirely so v1.5 output is preserved for
+    runs without LLMs file activity.
+    """
+    payload: dict[str, dict[str, object]] = {}
+    for bot in sorted(AI_CRAWLERS):
+        url_counts = agg.bot_urls.get(bot)
+        if not url_counts:
+            continue
+        full_count = url_counts.get("/llms-full.txt", 0)
+        index_count = url_counts.get("/llms.txt", 0)
+        if full_count + index_count == 0:
+            continue
+        label, full_ratio = _classify_ai_depth_preference(full_count, index_count)
+        payload[bot] = {
+            "llms_txt_fetches": index_count,
+            "llms_full_txt_fetches": full_count,
+            "full_content_ratio": full_ratio,
+            "preference": label,
+        }
+    return payload
+
+
+def _render_ai_depth_preference(agg: Aggregate) -> list[str]:
+    """Return the per-crawler depth-preference lines for the AI Crawler
+    Report subsection introduced in v1.6.
+
+    For each AI crawler that has fetched at least one of /llms.txt or
+    /llms-full.txt during the report period, classify its preference.
+    See _classify_ai_depth_preference() for the classification rules.
+
+    A crawler that has only hit /robots.txt (no LLMs file activity) is
+    deliberately excluded from this subsection — those crawlers appear
+    in the main AI crawler listing above but don't carry a depth signal
+    worth surfacing here.
+    """
+    lines: list[str] = []
+    for bot in sorted(AI_CRAWLERS):
+        url_counts = agg.bot_urls.get(bot)
+        if not url_counts:
+            continue
+        full_count = url_counts.get("/llms-full.txt", 0)
+        index_count = url_counts.get("/llms.txt", 0)
+        if full_count + index_count == 0:
+            continue
+        label, _ = _classify_ai_depth_preference(full_count, index_count)
+        lines.append(f"  {bot}")
+        lines.append(f"    llms.txt: {index_count}, llms-full.txt: {full_count}")
+        lines.append(f"    preference: {label}")
+    return lines
 
 
 def render_section_breakdown(agg: Aggregate, fmt: str) -> str:
@@ -1900,6 +2031,14 @@ def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None
             if bot_payload:
                 attribution_payload[bot] = bot_payload
         payload["redirect_attribution"] = attribution_payload
+
+    # v1.6: AI crawler depth-preference structured output. Omitted when
+    # no AI crawler has fetched at least one of /llms.txt or /llms-full.txt
+    # during the report period, so combined-format runs without LLMs file
+    # activity produce identical JSON to v1.5.
+    depth_payload = _compute_ai_depth_preference_payload(agg)
+    if depth_payload:
+        payload["ai_crawler_depth_preference"] = depth_payload
 
     return json.dumps(payload, indent=2, sort_keys=True, default=str)
 

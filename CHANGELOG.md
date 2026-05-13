@@ -7,6 +7,155 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## v1.6.0 — 2026-05-13
+
+Two operational improvements driven by two days of running v1.5.0 against
+the speytech.com production log. Both came directly from real findings
+in the daily report rather than speculative feature work.
+
+### Added
+
+- **AI crawler content-depth preference subsection** in the AI Crawler
+  Report. For each AI crawler that has fetched at least one of
+  `/llms.txt` or `/llms-full.txt` during the report period, classifies
+  the depth preference as one of:
+
+  | Pattern | Label |
+  |---------|-------|
+  | 100% one depth, 0 of the other | `exclusive: full-content` / `exclusive: index-only` |
+  | >= 75% one depth, >0 of the other | `prefers full-content` / `prefers index-only` (with percentage) |
+  | 25-75% split | `mixed` (with percentage breakdown) |
+  | Single fetch total | `insufficient data` |
+
+  Example output:
+
+  ~~~
+  Content-depth preference (LLMs file fetches)
+    Amazonbot
+      llms.txt: 1, llms-full.txt: 19
+      preference: prefers full-content (95% full)
+    ChatGPT-User
+      llms.txt: 5, llms-full.txt: 0
+      preference: exclusive: index-only
+  ~~~
+
+  Crawlers that have only hit `/robots.txt` (e.g. ClaudeBot during the
+  v1.5.0 → v1.6.0 window) are filtered out of this subsection — they
+  still appear in the main AI Crawler Report listing but don't carry a
+  depth signal worth surfacing here.
+
+  The distinction between "exclusive" and "prefers" preserves an
+  operationally meaningful signal: "exclusive" tells the operator the
+  crawler has a hard preference (informative for AEO file-publication
+  strategy); "prefers" tells them the crawler will sometimes fetch the
+  other depth.
+
+- New JSON key `ai_crawler_depth_preference` with the same classification
+  data:
+
+  ~~~json
+  "ai_crawler_depth_preference": {
+    "Amazonbot": {
+      "llms_txt_fetches": 1,
+      "llms_full_txt_fetches": 19,
+      "full_content_ratio": 0.95,
+      "preference": "prefers full-content (95% full)"
+    }
+  }
+  ~~~
+
+  Key is omitted entirely (not `null` or `{}`) when no AI crawler has
+  fetched any LLMs file during the period.
+
+### Changed
+
+- **Canonical-loop CRITICAL threshold raised from `>= 3` to `>= 50`,
+  with a new `[high-traffic redirect]` annotation for counts in
+  the 3-49 band.** The previous threshold was producing false CRITICAL
+  flags for working redirects under heavy crawler revalidation. Today's
+  daily report showed three working 301s flagged CRITICAL (counts 22,
+  11, 11) that the same morning's seo-validator v7.4 section 21
+  confirmed were resolving cleanly.
+
+  v1.6.0 distinguishes three bands:
+
+  | Count | Annotation | Severity |
+  |-------|------------|----------|
+  | 1-2 | (silent) | INFO |
+  | 3-49 | `[high-traffic redirect]` | INFO |
+  | >= 50 | (none — the `[CRITICAL]` prefix conveys it) | CRITICAL |
+
+  Before (v1.5.0):
+
+  ~~~
+    [CRITICAL]  22 × /images/cardiocore-litigation.svg  (22 canonical-loop)
+    [CRITICAL]  11 × /contact-us/  (11 canonical-loop)
+     2 × /legacy-rename/  (2 canonical-loop)
+  ~~~
+
+  After (v1.6.0):
+
+  ~~~
+     22 × /images/cardiocore-litigation.svg  (22 canonical-loop) [high-traffic redirect]
+     11 × /contact-us/  (11 canonical-loop) [high-traffic redirect]
+      2 × /legacy-rename/  (2 canonical-loop)
+    [CRITICAL] 100 × /genuinely-looping/  (100 canonical-loop)
+  ~~~
+
+  Thresholds are exposed as module-level constants for future tuning:
+
+  ~~~python
+  CANONICAL_LOOP_HIGH_TRAFFIC_THRESHOLD = 3
+  CANONICAL_LOOP_CRITICAL_THRESHOLD = 50
+  ~~~
+
+  Calibrated empirically from production data showing working redirects
+  clustering in the 11-22 range under Googlebot revalidation after
+  IndexNow pings. The 50 boundary leaves a generous buffer above
+  observed working values while remaining low enough to catch a genuine
+  loop early.
+
+### Notes
+
+The v1.6 requirements document captured seven candidate features.
+v1.6.0 ships items 1 and 2 only. Deferred items:
+
+- **Item 3** (operator IP defaults via config file) — UX improvement,
+  doesn't change reporting behaviour. Worth a separate small release
+  where it can stand on its own.
+- **Item 4** (CSP violation log parsing) — different log source (JSON,
+  not nginx-text). Better as a separate tool than wired into this
+  analyser.
+- **Items 5-7** (build determinism check, IndexNow URL set dump,
+  ClaudeBot family aggregation) — low operational urgency, accumulate
+  findings before scoping.
+
+### Preserved
+
+- Text output for combined-format input (no `redirect_attribution` data)
+  remains byte-identical to v1.5.0. The fallback heuristic notes are
+  unchanged.
+- JSON output adds one conditional top-level key
+  (`ai_crawler_depth_preference`). v1.5.0 consumers that ignore it see
+  identical JSON.
+- The `redirects` section structure is unchanged. Only the `[CRITICAL]`
+  prefix and `[high-traffic redirect]` suffix render changes are
+  affected by the threshold tuning.
+- No new CLI flags. Every v1.5.0 invocation continues to work unchanged.
+
+### Verification
+
+- 8 unit tests covering boundary behaviour at counts 0/1/2/3/22/49/50/100
+  and all 12 depth-preference classification cases.
+- End-to-end smoke test against synthetic seo_crawl log producing the
+  three redirect bands and three AI crawler patterns.
+- Backward compatibility confirmed: combined-format input renders
+  identically to v1.5.0; JSON omits the new key when no LLMs activity.
+
+Verification recipe in `docs/VERIFICATION-v1.6.0.md`.
+
+---
+
 # v1.5.0 — 2026-05-13
 
 Two targeted operational improvements following two days of intensive use against the speytech.com production log. Both came directly from real findings in the daily analyser report rather than speculative feature work.
