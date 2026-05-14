@@ -1,0 +1,48 @@
+# Example configuration file for crawler-log-analyser v1.8+.
+#
+# Place this file at one of:
+#   $XDG_CONFIG_HOME/crawler-log-analyser/config.toml
+#   ~/.config/crawler-log-analyser/config.toml
+#   ~/.crawler-log-analyser.toml
+#
+# Or point at it explicitly with --config /path/to/file.toml.
+#
+# The analyser searches the locations above in order and uses the
+# first match. Use --show-config to verify which file is being read.
+#
+# This file is TOML. On Python 3.11+ the analyser uses the stdlib
+# tomllib parser (full TOML spec). On 3.8-3.10 it uses a minimal
+# fallback parser that supports:
+#   - # comments and blank lines
+#   - key = "string value"
+#   - key = ["item one", "item two"]
+# More advanced TOML features ([section] tables, integers, booleans,
+# inline tables, multi-line strings) require Python 3.11+.
+
+
+# ---------------------------------------------------------------------
+# ignore_source_ips
+# ---------------------------------------------------------------------
+#
+# List of source IPs to exclude from probe-classification aggregation.
+# Typical use: filter operator self-test traffic from the host VM so
+# curl tests originating from the same server as nginx don't inflate
+# the daily probe-noise summary.
+#
+# Equivalent to passing --ignore-source-ip on every invocation. CLI
+# flags add to this list rather than replacing it; --no-config-ignores
+# clears the config-supplied entries for a one-off run without
+# editing the file.
+#
+# Does NOT affect bot statistics, health scores, or any other
+# classification. Only the "Suppressed Security Probe Noise" tally
+# and its associated path/IP counters change.
+
+ignore_source_ips = [
+    # SpeyTech Axioma host (operator self-test curls)
+    "35.230.156.201",
+
+    # Add more standing operator IPs here, one per line, comma-separated:
+    # "10.0.0.5",
+    # "192.0.2.42",
+]

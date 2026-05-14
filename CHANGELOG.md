@@ -7,6 +7,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## v1.8.0 — 2026-05-14
+
+One operational improvement deferred from the v1.7 requirements list:
+operator IP defaults via config file. Previously every daily run had
+to pass `--ignore-source-ip 35.230.156.201` explicitly to filter
+operator self-test traffic out of the probe-noise summary; v1.8.0
+reads a standing config file so the standing default doesn't need to
+be re-typed.
+
+This is also the first stateful file the analyser reads (config is
+operator-managed, but the precedent matters). The design is read-only
+at run time and additive on top of CLI flags, so the disciplined
+"single-file deployment, no external dependencies" property of the
+project is preserved.
+
+### Added
+
+- **Config file support** at one of the following locations, searched
+  in order (first match wins):
+
+  1. `--config PATH` (explicit override)
+  2. `$XDG_CONFIG_HOME/crawler-log-analyser/config.toml`
+  3. `~/.config/crawler-log-analyser/config.toml`
+  4. `~/.crawler-log-analyser.toml`
+
+  The file is TOML. On Python 3.11+ the analyser uses the stdlib
+  `tomllib` parser (full TOML spec). On 3.8-3.10 a minimal fallback
+  parser handles the v1.8 subset (string values, string arrays,
+  comments, blank lines). No new external dependency in either case.
+
+- **`ignore_source_ips`** config key. List of IPs to exclude from
+  probe-classification aggregation. Equivalent to passing
+  `--ignore-source-ip` repeatedly. Example:
+
+  ~~~toml
+  ignore_source_ips = [
+      "35.230.156.201",  # Axioma host self-tests
+      "10.0.0.5",        # internal monitoring
+  ]
+  ~~~
+
+- **`--config PATH`** to specify a non-default config file location.
+  An explicit path is used verbatim; if the file doesn't exist, the
+  analyser emits a stderr warning and continues without config.
+
+- **`--show-config`** prints the resolved configuration and exits 0.
+  Shows the source file path, IPs supplied by config, IPs supplied
+  by CLI, the merged effective set, any unknown config keys, and any
+  parse warnings. Designed for cron-job verification and for
+  diagnosing config-file issues without enabling debug output.
+  Does not require log paths — useful as a config sanity check
+  before scheduling.
+
+- **`--no-config-ignores`** discards the config-supplied
+  `ignore_source_ips` for a single run while keeping any CLI
+  `--ignore-source-ip` values. Use this for ad-hoc investigation
+  runs where the standing config defaults would mask data the
+  operator wants to see.
+
+- Example `examples/config.toml` documenting the format with a
+  worked operator-IP entry.
+
+- Verification recipe in `docs/VERIFICATION-v1.8.0.md`.
+
+### Merge semantics
+
+CLI flags **extend** the config file rather than replacing it.
+
+| Setting | Effect on `ignore_source_ips` |
+|---------|-------------------------------|
+| Config file with IPs, no CLI flags | Config IPs applied |
+| Config file with IPs, CLI flags too | Both lists merged (union) |
+| Config file with IPs, CLI `--no-config-ignores`, no CLI IPs | Empty set |
+| Config file with IPs, CLI `--no-config-ignores`, CLI IPs | CLI IPs only |
+| No config file, CLI IPs | CLI IPs only |
+| No config file, no CLI IPs | Empty set (v1.7 behaviour) |
+
+Deduplicated via frozenset; an IP listed in both config and CLI
+counts once.
+
+### Failure modes (all non-fatal)
+
+A config file problem must never block the daily report. The
+following all produce a stderr warning and continue with whatever
+could be parsed, falling back to an empty config when nothing could
+be:
+
+- Config file path is non-existent (explicit `--config`)
+- Config file exists but is unreadable (permissions)
+- Config file contains malformed TOML
+- `ignore_source_ips` has wrong type (e.g. a string instead of a list)
+- Config file contains keys the analyser doesn't recognise (likely
+  future-version keys — accepted gracefully so v1.8 invocations
+  against newer config files don't fail)
+
+Warnings are deterministic and prefixed with `warning:` for grep
+filtering in cron logs.
+
+### Changed
+
+- The positional `paths` argument is now `nargs="*"` (was `nargs="+"`)
+  so `--show-config` can run without supplying log files. When `paths`
+  is empty and `--show-config` is not set, the analyser still emits
+  `error: no log files to analyse` and exits 2, matching v1.7
+  behaviour for that scenario.
+
+### Preserved
+
+- All v1.7.0 CLI invocations continue to work unchanged. The four
+  new flags (`--config`, `--show-config`, `--no-config-ignores`, and
+  the implicit config-file discovery) are additive with defaults
+  that preserve v1.7 behaviour.
+
+- **Byte-identical text output to v1.7.0 for any input when no config
+  file is present.** Verified by md5sum on identical input log:
+  v1.7.0 and v1.8.0 produce identical output (md5:
+  `c4614a7d3002756416e4339e60fd47a8` on the smoke-test log fixture).
+
+- JSON output schema is unchanged. No new top-level keys. v1.7.0
+  consumers see identical JSON.
+
+- All v1.7 health-score logic, spoof detection, named bot patterns,
+  and post-IndexNow window suppression behave identically.
+
+- Zero new dependencies. The program remains a single-file Python
+  stdlib script. tomllib on 3.11+ is stdlib; the fallback parser on
+  3.8-3.10 is internal.
+
+### Notes
+
+The v1.7 requirements doc captured three deferred items. v1.8.0 ships
+item 1 only:
+
+- **Config file defaults** (this release) — solves a daily-friction
+  problem (the `--ignore-source-ip 35.230.156.201` repetition).
+- **Cross-day spoofer ASN/CIDR tracking** — deferred to v1.9 or
+  later. Two days of v1.7 data showed two Vietnamese-broadband-range
+  spoofers from `14.169.0.0/16`, which is suggestive but not yet a
+  reliable pattern. Premature design here means designing for one
+  observation. Worth re-evaluating after a fortnight of v1.8
+  daily-report data.
+- **CSP log parsing** — different log format, belongs in a separate
+  `csp-log-analyser` tool (not this one).
+
+The choice to ship one feature at a time, with explicit verification
+of "v1.7 output == v1.8 output when feature not in use", continues
+the v1.x posture established by earlier releases.
+
+### Verification
+
+- 27 v1.8-specific tests in `test_v18.py`: 6 path-discovery scenarios,
+  6 load_config failure modes, 5 fallback-parser cases, 4 merge-semantics
+  cases, 6 end-to-end CLI cases.
+
+- 36 v1.7 regression tests in `test_v17.py` still pass against the
+  v1.8 build.
+
+- Backward compatibility confirmed by md5sum: text output for a
+  combined-format log with no config file in the discovery search
+  order is byte-identical to v1.7.0 output for the same input.
+
+- Verification recipe in `docs/VERIFICATION-v1.8.0.md`.
+
+---
+
 ## v1.7.0 — 2026-05-14
 
 Three operational improvements driven by two days of running v1.6.0

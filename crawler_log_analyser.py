@@ -19,18 +19,19 @@ Usage:
 
 No external dependencies required.
 
-Version: 1.7.0
+Version: 1.8.0
 Author: William Murray, SpeyTech
 """
 
 from __future__ import annotations
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 import argparse
 import gzip
 import io
 import json
+import os
 import re
 import statistics
 import sys
@@ -208,6 +209,28 @@ REDIRECT_RATE_SEVERE_THRESHOLD = 0.50    # at/above this: always deduct, regardl
 # "Exclusive" is determined by the other depth's count being zero (no
 # threshold needed); the ratio threshold separates "prefers" from "mixed".
 AI_DEPTH_PREFERENCE_RATIO = 0.75
+
+# v1.8 config file discovery.
+#
+# Search order (first match wins):
+#   1. --config PATH (handled in main(), not here)
+#   2. $XDG_CONFIG_HOME/crawler-log-analyser/config.toml
+#   3. ~/.config/crawler-log-analyser/config.toml
+#   4. ~/.crawler-log-analyser.toml
+#
+# Conventional XDG layout for new adopters; home-dot fallback for
+# operators who prefer the flat-home convention. Recipe documented in
+# examples/config.toml.
+CONFIG_FILE_BASENAME = "config.toml"
+CONFIG_DIR_NAME = "crawler-log-analyser"
+CONFIG_HOME_DOT_NAME = ".crawler-log-analyser.toml"
+
+# Known top-level keys in the config file. Unknown keys produce a
+# stderr warning but do not fail the run, so v1.9+ can add keys without
+# breaking v1.8 invocations against newer config files.
+CONFIG_KNOWN_KEYS: frozenset[str] = frozenset({
+    "ignore_source_ips",
+})
 
 # URL category classifiers, evaluated top to bottom.
 URL_CATEGORIES: list[tuple[str, re.Pattern[str]]] = [
@@ -459,6 +482,291 @@ class Finding:
             -SEVERITY_RANK.get(other.severity, 0),
             other.message,
         )
+
+
+# ---------------------------------------------------------------------------
+# Configuration loading (v1.8)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ResolvedConfig:
+    """Container for the merged config + CLI state.
+
+    source_path: the actual file the config was loaded from, or None if
+        no config file was present (run is using CLI args only).
+    ignore_source_ips_from_config: IPs supplied by the config file.
+    ignore_source_ips_from_cli: IPs supplied by --ignore-source-ip.
+    unknown_keys: any keys in the config file that the analyser didn't
+        recognise. Surfaced as stderr warnings but never fatal.
+    parse_warnings: any non-fatal parse problems (e.g. file unreadable,
+        malformed TOML, value type mismatch). Surfaced as stderr but
+        never fatal.
+    """
+    source_path: Path | None = None
+    ignore_source_ips_from_config: list[str] = field(default_factory=list)
+    ignore_source_ips_from_cli: list[str] = field(default_factory=list)
+    unknown_keys: list[str] = field(default_factory=list)
+    parse_warnings: list[str] = field(default_factory=list)
+
+    @property
+    def effective_ignore_source_ips(self) -> frozenset[str]:
+        """The merged set of IPs to ignore for probe classification.
+
+        Additive by default: config IPs + CLI IPs. The --no-config-ignores
+        flag clears the config contribution before this property is
+        computed (handled in main()).
+        """
+        return frozenset(
+            self.ignore_source_ips_from_config + self.ignore_source_ips_from_cli
+        )
+
+
+def discover_config_path(explicit: str | None = None) -> Path | None:
+    """Locate the first existing config file along the v1.8 search order.
+
+    1. explicit (from --config) if non-None and the file exists
+    2. $XDG_CONFIG_HOME/crawler-log-analyser/config.toml
+    3. ~/.config/crawler-log-analyser/config.toml
+    4. ~/.crawler-log-analyser.toml
+
+    Returns None if no config file is found. An explicit path that
+    points at a non-existent file is treated as an operator error and
+    returned anyway so the caller can surface a clear "you asked for
+    X, X doesn't exist" warning (rather than silently falling back to
+    the search order, which would be more confusing).
+    """
+    if explicit:
+        return Path(explicit).expanduser()
+
+    xdg_home = os.environ.get("XDG_CONFIG_HOME")
+    candidates: list[Path] = []
+    if xdg_home:
+        candidates.append(Path(xdg_home) / CONFIG_DIR_NAME / CONFIG_FILE_BASENAME)
+    candidates.append(Path.home() / ".config" / CONFIG_DIR_NAME / CONFIG_FILE_BASENAME)
+    candidates.append(Path.home() / CONFIG_HOME_DOT_NAME)
+
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _parse_toml_subset(content: str) -> tuple[dict[str, object], list[str]]:
+    """Minimal TOML parser covering the v1.8 config subset.
+
+    Supported syntax:
+        # comment line
+        key = "string value"
+        key = ["item one", "item two", "item three"]
+        (blank lines)
+
+    NOT supported (will produce a parse warning):
+        [section] tables
+        inline tables { x = 1 }
+        nested arrays
+        numeric values, booleans, dates
+
+    The v1.8 config schema only needs string values and string-array
+    values; the broader TOML surface is deliberately out of scope so
+    this fallback parser stays small and predictable. Python 3.11+
+    users get tomllib via the load_config() shim, which handles the
+    full TOML spec correctly.
+
+    Returns (parsed_dict, warnings).
+    """
+    parsed: dict[str, object] = {}
+    warnings: list[str] = []
+
+    for lineno, raw in enumerate(content.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # Strip trailing comments (best-effort; doesn't handle # inside
+        # strings, which is a TOML edge case we don't need for v1.8).
+        if "#" in line and '"' not in line.split("#", 1)[0]:
+            line = line.split("#", 1)[0].strip()
+
+        if line.startswith("["):
+            warnings.append(
+                f"line {lineno}: [section] tables not supported by the "
+                "fallback TOML parser (use Python 3.11+ for full TOML)"
+            )
+            continue
+
+        if "=" not in line:
+            warnings.append(f"line {lineno}: expected 'key = value', got: {raw!r}")
+            continue
+
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+
+        # String value
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            parsed[key] = value[1:-1]
+            continue
+
+        # Array value (single-line only)
+        if value.startswith("[") and value.endswith("]"):
+            inner = value[1:-1].strip()
+            if not inner:
+                parsed[key] = []
+                continue
+            items: list[str] = []
+            ok = True
+            # Split on commas not inside quotes. Simple state machine.
+            buf = ""
+            in_string = False
+            for ch in inner:
+                if ch == '"':
+                    in_string = not in_string
+                    buf += ch
+                elif ch == "," and not in_string:
+                    items.append(buf.strip())
+                    buf = ""
+                else:
+                    buf += ch
+            if buf.strip():
+                items.append(buf.strip())
+            cleaned: list[str] = []
+            for item in items:
+                if item.startswith('"') and item.endswith('"') and len(item) >= 2:
+                    cleaned.append(item[1:-1])
+                else:
+                    warnings.append(
+                        f"line {lineno}: array item is not a quoted string: {item!r}"
+                    )
+                    ok = False
+                    break
+            if ok:
+                parsed[key] = cleaned
+            continue
+
+        warnings.append(
+            f"line {lineno}: unsupported value shape for key {key!r}: {value!r}"
+        )
+
+    return parsed, warnings
+
+
+def load_config(path: Path | None) -> ResolvedConfig:
+    """Read and validate the config file. Always returns a ResolvedConfig.
+
+    Failure modes are all non-fatal: unreadable file, malformed TOML,
+    type mismatches, unknown keys. Each produces a stderr-bound warning
+    in the returned config object; the run continues with whatever
+    could be parsed (or an empty config if nothing could be parsed).
+
+    Rationale: a config file problem should never block daily reports.
+    The operator wants the report; the config file is a convenience.
+    """
+    config = ResolvedConfig(source_path=path)
+    if path is None:
+        return config
+
+    if not path.is_file():
+        config.parse_warnings.append(
+            f"config file {path} not found; continuing without config"
+        )
+        return config
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        config.parse_warnings.append(
+            f"could not read config file {path}: {exc}; continuing without config"
+        )
+        return config
+
+    # Prefer stdlib tomllib (Python 3.11+) when available; fall back to
+    # the minimal subset parser otherwise. tomllib handles full TOML
+    # spec including [section] tables, integers, booleans, etc; the
+    # fallback is deliberately small.
+    parsed: dict[str, object]
+    try:
+        import tomllib  # type: ignore[import-not-found]
+        try:
+            parsed = tomllib.loads(content)
+        except tomllib.TOMLDecodeError as exc:
+            config.parse_warnings.append(
+                f"config file {path} has invalid TOML: {exc}; continuing without config"
+            )
+            return config
+    except ImportError:
+        parsed, fallback_warnings = _parse_toml_subset(content)
+        for w in fallback_warnings:
+            config.parse_warnings.append(f"{path}: {w}")
+
+    # Validate the parsed data against the known schema.
+    for key, value in parsed.items():
+        if key not in CONFIG_KNOWN_KEYS:
+            config.unknown_keys.append(key)
+            continue
+        if key == "ignore_source_ips":
+            if not isinstance(value, list):
+                config.parse_warnings.append(
+                    f"config key 'ignore_source_ips' must be a list of strings, "
+                    f"got {type(value).__name__}; ignoring this key"
+                )
+                continue
+            for ip in value:
+                if not isinstance(ip, str):
+                    config.parse_warnings.append(
+                        f"config key 'ignore_source_ips' contains non-string "
+                        f"entry {ip!r}; ignoring this entry"
+                    )
+                    continue
+                config.ignore_source_ips_from_config.append(ip)
+
+    return config
+
+
+def render_config_summary(config: ResolvedConfig) -> str:
+    """Render the resolved config for --show-config output.
+
+    Plain text, deterministic ordering, suitable for both human reading
+    and cron-job log capture. Always shows the source path (or 'none'),
+    the IPs supplied by each side (config / CLI), and the merged
+    effective set. Includes any unknown keys and parse warnings so the
+    operator can diagnose config issues without enabling debug output.
+    """
+    lines = ["Resolved configuration"]
+    lines.append("─" * len("Resolved configuration"))
+    lines.append("")
+    src = str(config.source_path) if config.source_path is not None else "(none)"
+    lines.append(f"Source: {src}")
+    lines.append("")
+
+    cfg_ips = config.ignore_source_ips_from_config
+    cli_ips = config.ignore_source_ips_from_cli
+    lines.append(f"ignore_source_ips (from config): {len(cfg_ips)}")
+    for ip in cfg_ips:
+        lines.append(f"  {ip}")
+    lines.append(f"ignore_source_ips (from CLI):    {len(cli_ips)}")
+    for ip in cli_ips:
+        lines.append(f"  {ip}")
+
+    effective = sorted(config.effective_ignore_source_ips)
+    lines.append("")
+    lines.append(f"Effective ignore-source-ip set ({len(effective)} IPs):")
+    for ip in effective:
+        lines.append(f"  {ip}")
+
+    if config.unknown_keys:
+        lines.append("")
+        lines.append("Unknown config keys (ignored, but worth checking):")
+        for k in config.unknown_keys:
+            lines.append(f"  {k}")
+
+    if config.parse_warnings:
+        lines.append("")
+        lines.append("Parse warnings:")
+        for w in config.parse_warnings:
+            lines.append(f"  {w}")
+
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -2463,7 +2771,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument("--version", action="version",
                    version=f"%(prog)s {__version__}")
-    p.add_argument("paths", nargs="+", help="One or more nginx log files (plain or .gz). Globs supported.")
+    p.add_argument("paths", nargs="*", help="One or more nginx log files (plain or .gz). Globs supported.")
     p.add_argument("--bot", default="all",
                    help="Restrict the report to a single bot family, or 'all' (default).")
     p.add_argument("--from", dest="date_from", default=None,
@@ -2521,6 +2829,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="v1.7: include the full per-request listing in the "
                         "Suspected UA-Spoof Detection section. Default is "
                         "summary only (UA-label counts + top source IPs).")
+    # v1.8 config-file flags
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="v1.8: explicit path to the config file. "
+                        "When omitted, the standard search order applies: "
+                        "$XDG_CONFIG_HOME/crawler-log-analyser/config.toml, "
+                        "~/.config/crawler-log-analyser/config.toml, "
+                        "~/.crawler-log-analyser.toml.")
+    p.add_argument("--show-config", action="store_true",
+                   dest="show_config",
+                   help="v1.8: print the resolved configuration (source "
+                        "file, IPs from config, IPs from CLI, merged "
+                        "effective set) and exit. Useful for verifying "
+                        "what a cron run will actually use.")
+    p.add_argument("--no-config-ignores", action="store_true",
+                   dest="no_config_ignores",
+                   help="v1.8: ignore the 'ignore_source_ips' list from "
+                        "the config file. CLI --ignore-source-ip values "
+                        "still apply. Use this to opt out of standing "
+                        "defaults for a one-off run without editing the "
+                        "config file.")
     return p.parse_args(argv)
 
 
@@ -2629,6 +2957,35 @@ def render_report(agg: Aggregate, args: argparse.Namespace,
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
+    # v1.8: resolve config file before anything else so --show-config can
+    # short-circuit without requiring log paths, and so config warnings
+    # are emitted in a single block before report rendering.
+    config_path = discover_config_path(args.config)
+    config = load_config(config_path)
+    config.ignore_source_ips_from_cli = list(args.ignored_ips)
+
+    # If the operator passed --no-config-ignores, drop the config-supplied
+    # IPs but keep the CLI-supplied ones. Useful for one-off investigation
+    # runs where the standing config defaults would mask the data.
+    if args.no_config_ignores:
+        config.ignore_source_ips_from_config = []
+
+    # Emit any parse warnings to stderr so they're captured by cron logs
+    # but don't pollute stdout reports.
+    for warning in config.parse_warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    for unknown in config.unknown_keys:
+        print(
+            f"warning: unknown config key {unknown!r} ignored "
+            f"(may be supported by a future version)",
+            file=sys.stderr,
+        )
+
+    # --show-config short-circuits before any log parsing.
+    if args.show_config:
+        print(render_config_summary(config))
+        return 0
+
     paths = expand_paths(args.paths)
     if not paths:
         print("error: no log files to analyse", file=sys.stderr)
@@ -2644,7 +3001,7 @@ def main(argv: list[str] | None = None) -> int:
         entries,
         include_non_bots=args.include_non_bots,
         show_security_probes=args.show_security_probes,
-        ignored_probe_ips=frozenset(args.ignored_ips),
+        ignored_probe_ips=config.effective_ignore_source_ips,
     )
     agg.stats = stats
 
