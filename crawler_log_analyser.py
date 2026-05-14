@@ -19,13 +19,13 @@ Usage:
 
 No external dependencies required.
 
-Version: 1.6.0
+Version: 1.7.0
 Author: William Murray, SpeyTech
 """
 
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import argparse
 import gzip
@@ -86,6 +86,18 @@ BOT_PATTERNS: list[tuple[str, str, bool]] = [
     ("PetalBot",            r"PetalBot",                           False),
     ("SleepBot",            r"SleepBot",                           True),
     ("TikTokSpider",        r"TikTokSpider",                       True),
+    # v1.7: four crawlers promoted out of the GenericBot catch-all.
+    # DotBot is Moz's backlink crawler; Qwantbot is the Qwant search
+    # engine (European/French); SeznamBot is Seznam.cz (Czech search);
+    # SERankingBacklinksBot is SE Ranking's backlink crawler. All four
+    # are search/SEO bots, not AI crawlers (is_ai=False). Deliberately
+    # NOT added to SEARCH_CRAWLERS — DotBot and SERanking are SEO
+    # tools (not user-facing search), Qwant and Seznam are regional;
+    # including them would dilute the search-crawler health score.
+    ("DotBot",              r"DotBot",                             False),
+    ("Qwantbot",            r"Qwantbot",                           False),
+    ("SeznamBot",           r"SeznamBot",                          False),
+    ("SERankingBacklinksBot", r"SERankingBacklinksBot",            False),
     # RSS readers. Neither search nor AI; they represent direct
     # subscriber-driven polling. Worth counting but not weighted in the
     # AI crawler report or search-crawler health score (is_ai=False).
@@ -115,6 +127,79 @@ SPECIAL_FILES: list[str] = [
 # from Googlebot revalidation after IndexNow pings.
 CANONICAL_LOOP_HIGH_TRAFFIC_THRESHOLD = 3   # >= this count: annotate as "high-traffic redirect"
 CANONICAL_LOOP_CRITICAL_THRESHOLD = 50      # >= this count: flag CRITICAL
+
+# v1.7 UA-spoof behavioural detection.
+#
+# The Firefox-UA analysis on 2026-05-13 surfaced five requests across five
+# distinct IPs, each spoofing a different Firefox version, each fetching a
+# sitemap-related path with an empty referrer. Real browser sessions do
+# not fetch sitemap files directly — humans navigate to articles via
+# search results, RSS readers, or links, all of which produce a non-empty
+# referrer or a path other than the sitemap set.
+#
+# The discriminating combination is: browser-like UA + empty referrer +
+# path in SPOOF_TRIGGER_PATHS. Each individual signal can be legitimate;
+# the combination cannot.
+SPOOF_DETECTION_NAME = "SuspectedUASpoof"
+
+# Browser-UA detector. Used by is_likely_browser_ua() in the second-stage
+# spoof check. Deliberately permissive: any Mozilla/5.0 UA that names one
+# of the major browser engines counts as browser-like. Real bots that
+# legitimately identify themselves (e.g. "Mozilla/5.0 (compatible;
+# Googlebot/2.1)") are caught by the first-stage named-bot matcher before
+# this regex ever runs.
+BROWSER_UA_RE = re.compile(
+    r"Mozilla/5\.0.*(Firefox|Chrome|Safari|Edg)/"
+)
+
+# Paths whose direct fetch by a browser-UA session with no referrer is
+# incompatible with human browsing. /rss.xml is deliberately excluded
+# because some legitimate RSS readers do spoof browser UAs to bypass
+# anti-bot measures; an /rss.xml fetch is not the same noise class as a
+# /sitemap-*.xml fetch.
+SPOOF_TRIGGER_PATHS: frozenset[str] = frozenset({
+    "/robots.txt",
+    "/sitemap.xml",
+    "/sitemap-0.xml",
+    "/sitemap-index.xml",
+    "/sitemap.txt",
+    "/llms.txt",
+    "/llms-full.txt",
+})
+
+# Bot classifications eligible for second-stage spoof override. A request
+# already matched to a named bot (Googlebot, ClaudeBot, etc.) is left
+# alone — those bots identify themselves honestly. Override candidates
+# are the catch-all and empty-UA buckets where a browser-like UA is
+# suspicious.
+SPOOF_OVERRIDE_CANDIDATES: frozenset[str] = frozenset({
+    "Empty-UA",
+    "Human/Other",
+    "GenericBot",
+})
+
+# Bound on the number of full LogEntry rows stored for --show-spoof-detail.
+# Spoof traffic is typically a handful per day; this cap exists only to
+# keep memory bounded under pathological input. Beyond this count the
+# summary counters still record everything; only the detail listing is
+# truncated.
+SPOOF_DETAIL_CAP = 200
+
+# v1.7 post-IndexNow redirect-rate window. After an IndexNow ping
+# Googlebot does aggressive recheck sweeps that legitimately push the
+# redirect rate above the 25% threshold without indicating any
+# configuration problem. The analyser uses the first-seen timestamps of
+# high-traffic-redirect URLs as a proxy for "recent IndexNow ping". When
+# the proxy fires and the redirect rate is between 25% and 50%, the
+# deduction is suppressed and an INFO note is emitted instead.
+#
+# Above 50% the deduction always applies regardless of window — that
+# rate indicates a genuine configuration loop and is not explainable by
+# normal post-ping revalidation.
+POST_INDEXNOW_WINDOW_HOURS_DEFAULT = 4   # configurable via --post-indexnow-window-hours
+REDIRECT_RATE_WARN_THRESHOLD = 0.25      # below this: no deduction
+REDIRECT_RATE_SEVERE_THRESHOLD = 0.50    # at/above this: always deduct, regardless of window
+
 
 # v1.6 AI crawler depth-preference threshold. Used by the new
 # render_ai_crawler_depth_preference() subsection. A crawler's "full-content
@@ -407,6 +492,63 @@ def classify_bot(ua: str) -> tuple[str, bool]:
     return ("Human/Other", False)
 
 
+def is_likely_browser_ua(ua: str) -> bool:
+    """True if the UA looks like a major browser.
+
+    Used by the v1.7 second-stage spoof check. The first stage
+    (classify_bot) catches honest bots that identify themselves. A
+    request reaches this check only when the first stage classified it
+    as Empty-UA, Human/Other, or GenericBot. A genuine human session
+    will return True here; the spoof detection then depends on path and
+    referrer to distinguish a real session from a sitemap-scraping bot
+    wearing a browser disguise.
+    """
+    if not ua or ua == "-":
+        return False
+    return bool(BROWSER_UA_RE.search(ua))
+
+
+def is_spoof_behaviour(path: str, ua: str, referrer: str) -> bool:
+    """True if the request shape is incompatible with human browsing.
+
+    The discriminating combination — browser-like UA AND empty referrer
+    AND path in SPOOF_TRIGGER_PATHS — is what a real browser session
+    cannot produce. Humans don't navigate directly to /sitemap-0.xml
+    with a fresh tab; real sessions arrive with a referrer or with a
+    content-page path.
+
+    See SPOOF_TRIGGER_PATHS for the path set. /rss.xml is deliberately
+    excluded; some legitimate RSS readers spoof browser UAs.
+    """
+    if not is_likely_browser_ua(ua):
+        return False
+    if referrer and referrer != "-":
+        # Has a referrer — looks like real navigation, not direct
+        # sitemap scraping.
+        return False
+    return path in SPOOF_TRIGGER_PATHS
+
+
+def _short_ua_label(ua: str) -> str:
+    """Reduce a full UA string to a short browser+version label.
+
+    Used by the spoof report's UA summary so distinct full UAs that
+    share a browser+version collapse into one row. The label format is
+    "Firefox/133.0" or "Chrome/120.0.0.0" — taken from the first match
+    of the browser-engine token in the UA. Falls back to the truncated
+    raw UA when no recognised token is present, which keeps the report
+    informative even for unusual cases.
+    """
+    if not ua:
+        return "(empty)"
+    m = re.search(r"(Firefox|Chrome|Safari|Edg)/[\d.]+", ua)
+    if m:
+        return m.group(0)
+    # Fallback: first 60 characters of the raw UA. Long UAs are rare
+    # in the spoof-trigger set; the truncation keeps the report tidy.
+    return ua[:60]
+
+
 def classify_url(path: str) -> str:
     """Bucket a path into a coarse category for section-level reporting."""
     # Strip query string for classification.
@@ -466,7 +608,17 @@ def parse_line(line: str, log_format: str = LOG_FORMAT_COMBINED) -> LogEntry | N
                 path = request
 
     ua = m.group("ua")
+    referrer = m.group("referrer")
     bot, is_ai = classify_bot(ua)
+    # v1.7: second-stage spoof detection. A request that looks like a
+    # browser (Mozilla/5.0 ... Firefox/Chrome/Safari/Edg) but fetches a
+    # sitemap-class path with no referrer is incompatible with a real
+    # browser session. Override the first-stage classification only
+    # when the entry landed in one of the catch-all buckets — named
+    # bots that identify themselves honestly are left alone.
+    if bot in SPOOF_OVERRIDE_CANDIDATES and is_spoof_behaviour(path, ua, referrer):
+        bot = SPOOF_DETECTION_NAME
+        is_ai = False
     category = classify_url(path)
     probe = is_security_probe(path) if path else False
     framework = is_framework_probe(path) if path else False
@@ -488,7 +640,7 @@ def parse_line(line: str, log_format: str = LOG_FORMAT_COMBINED) -> LogEntry | N
         path=path,
         status=status,
         size=size,
-        referrer=m.group("referrer"),
+        referrer=referrer,
         ua=ua,
         bot=bot,
         is_ai=is_ai,
@@ -731,6 +883,47 @@ class Aggregate:
         default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
     )
 
+    # --- v1.7 UA-spoof detection -------------------------------------------
+    #
+    # Populated when an entry's bot field is SPOOF_DETECTION_NAME (set by
+    # parse_line's second-stage check). Drives the new Suspected UA-Spoof
+    # report section. Spoof entries are deliberately excluded from
+    # crawler_404s and from both health score cohorts — they are noise,
+    # not search signal.
+
+    spoof_count: int = 0
+    # UA fragment summary: short label (e.g. "Firefox/133.0") -> count.
+    # Truncating the full UA to a stable browser+version label keeps the
+    # report readable when many UAs share the same family.
+    spoof_ua_summary: Counter[str] = field(default_factory=Counter)
+    # IP -> list of (path, status) observed from that IP. Bounded per IP
+    # so a noisy spoofer doesn't blow up memory. Reported sample size is
+    # small (5 IPs in the report by default).
+    spoof_ip_observations: dict[str, list[tuple[str, int]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    # Bounded list of full log entries for --show-spoof-detail. Capped at
+    # SPOOF_DETAIL_CAP (defined at module scope) to keep memory bounded.
+    spoof_entries: list[LogEntry] = field(default_factory=list)
+
+    # --- v1.7 post-IndexNow redirect-rate window ---------------------------
+    #
+    # Maps a URL to the earliest timestamp at which it was observed with
+    # a canonical_loop redirect attribution. Populated during aggregation
+    # for every Googlebot redirect carrying the canonical_loop cause.
+    # The health-score logic queries this map at scoring time to detect
+    # whether the current redirect-rate elevation is a post-IndexNow
+    # revalidation burst (deduction suppressed) or a steady-state issue
+    # (deduction applied).
+    #
+    # The map records canonical_loop activity from any bot, not just
+    # Googlebot — the IndexNow burst affects all crawlers, and the
+    # first-seen timestamp is the signal regardless of which crawler hit
+    # the URL first.
+    high_traffic_redirect_first_seen: dict[str, datetime] = field(
+        default_factory=dict
+    )
+
 
 def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
               show_security_probes: bool,
@@ -799,10 +992,15 @@ def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
         # 404 handling: suppress probes from the main 404 list by default.
         # Framework probes are always suppressed from the main 404 list — they
         # are not actionable SEO findings.
+        # v1.7: SuspectedUASpoof entries are also suppressed from the
+        # main 404 list. Spoof traffic is noise rather than a search
+        # signal, and including it would skew the per-URL 404 view that
+        # the operator uses to triage real crawler-visible failures.
         if e.status == 404 and e.is_bot:
             include_in_404_list = (
                 (show_security_probes or not e.is_probe)
                 and not e.is_framework
+                and e.bot != SPOOF_DETECTION_NAME
             )
             if include_in_404_list:
                 agg.crawler_404s[e.path][e.bot] += 1
@@ -820,6 +1018,26 @@ def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
             if e.host is not None and e.scheme is not None:
                 cause = _classify_redirect_cause(e.scheme, e.host, e.path)
                 agg.redirect_attribution[e.bot][e.path][cause] += 1
+                # v1.7: record earliest canonical_loop sighting per URL
+                # for the post-IndexNow window check. Any canonical_loop
+                # cause from any bot contributes; the count threshold
+                # (HIGH_TRAFFIC) is applied at scoring time, not here.
+                if cause == "canonical_loop":
+                    prior = agg.high_traffic_redirect_first_seen.get(e.path)
+                    if prior is None or e.ts < prior:
+                        agg.high_traffic_redirect_first_seen[e.path] = e.ts
+
+        # v1.7: spoof-detection summary tracking. Recorded for every
+        # entry the second-stage check flagged. Separate from
+        # bot_status (which captures the same entries by classification
+        # name) because the spoof report wants per-IP path-fetched
+        # detail that bot_status doesn't carry.
+        if e.bot == SPOOF_DETECTION_NAME:
+            agg.spoof_count += 1
+            agg.spoof_ua_summary[_short_ua_label(e.ua)] += 1
+            agg.spoof_ip_observations[e.ip].append((e.path, e.status))
+            if len(agg.spoof_entries) < SPOOF_DETAIL_CAP:
+                agg.spoof_entries.append(e)
 
         # v1.3: latency tracking from seo_crawl format.
         if e.request_time is not None:
@@ -913,9 +1131,48 @@ def compute_percentiles(samples: list[float]) -> dict[str, float] | None:
     }
 
 
+def in_post_indexnow_window(
+    agg: Aggregate,
+    hours: int = POST_INDEXNOW_WINDOW_HOURS_DEFAULT,
+) -> bool:
+    """Heuristic: are we inside a post-IndexNow revalidation burst?
+
+    The analyser cannot observe IndexNow pings directly. The usable
+    proxy is the first-seen timestamp of URLs that already qualify as
+    high-traffic redirects (canonical_loop count >= HIGH_TRAFFIC and
+    < CRITICAL — i.e. working redirects under heavy crawler load). If
+    one or more such URLs first appeared within the last N hours of
+    the report period, Googlebot is likely in the middle of a post-
+    ping recheck sweep, and elevated redirect rates are explainable.
+
+    Returns False when there are no high-traffic redirect URLs or
+    when agg.latest is unset (no entries observed). The caller is
+    responsible for deciding what to do with that information — this
+    helper only reports the timing condition.
+    """
+    if agg.latest is None:
+        return False
+    if not agg.high_traffic_redirect_first_seen:
+        return False
+    cutoff = agg.latest - timedelta(hours=hours)
+    # Restrict to URLs whose canonical_loop count actually qualifies as
+    # high-traffic. The first-seen map is populated for every
+    # canonical_loop sighting; the count check is the gate that
+    # distinguishes "stray legacy redirect" from "post-IndexNow burst".
+    for path, first_seen in agg.high_traffic_redirect_first_seen.items():
+        loop_count = sum(
+            attribution.get(path, Counter()).get("canonical_loop", 0)
+            for attribution in agg.redirect_attribution.values()
+        )
+        if loop_count >= CANONICAL_LOOP_HIGH_TRAFFIC_THRESHOLD and first_seen >= cutoff:
+            return True
+    return False
+
+
 def compute_health_score(
     agg: Aggregate,
     latency_threshold_ms: int = 1000,
+    post_indexnow_window_hours: int = POST_INDEXNOW_WINDOW_HOURS_DEFAULT,
 ) -> tuple[int, str, list[str]]:
     """Return (score, verdict, reasons) for Googlebot.
 
@@ -923,6 +1180,13 @@ def compute_health_score(
     an additional 5-point deduction. This check only fires when seo_crawl
     data is available for Googlebot (per spec §5.3); otherwise it is
     silently skipped, preserving combined-format behaviour bit-for-bit.
+
+    post_indexnow_window_hours controls the v1.7 redirect-rate
+    suppression window. The 25%-50% deduction is suppressed when a
+    high-traffic redirect URL was first seen within this window of
+    agg.latest, on the inference that Googlebot is in a post-IndexNow
+    recheck burst. The >=50% deduction always applies regardless of
+    window — that rate indicates a real loop, not normal revalidation.
     """
     score = 100
     reasons: list[str] = []
@@ -950,12 +1214,31 @@ def compute_health_score(
         pct = 100 * not_found / total
         reasons.append(f"-10: Googlebot 404 rate {pct:.1f}% (>1%)")
 
-    # Redirect rate
+    # Redirect rate (v1.7: two-tier with post-IndexNow window awareness)
     redirects = sum(c for s, c in gb_status.items() if 300 <= s < 400)
-    if total > 0 and redirects / total > 0.25:
-        score -= 5
-        pct = 100 * redirects / total
-        reasons.append(f"-5: Googlebot redirect rate {pct:.1f}% (>25%)")
+    if total > 0:
+        rate = redirects / total
+        pct = 100 * rate
+        if rate >= REDIRECT_RATE_SEVERE_THRESHOLD:
+            # >=50%: always deduct. This rate is incompatible with
+            # normal post-ping revalidation and indicates a genuine
+            # redirect loop or misconfiguration.
+            score -= 5
+            reasons.append(
+                f"-5: Googlebot redirect rate {pct:.1f}% (>={int(REDIRECT_RATE_SEVERE_THRESHOLD * 100)}%, severe)"
+            )
+        elif rate > REDIRECT_RATE_WARN_THRESHOLD:
+            # 25-50%: deduct unless we're in a post-IndexNow window.
+            if in_post_indexnow_window(agg, post_indexnow_window_hours):
+                reasons.append(
+                    f"INFO: Googlebot redirect rate {pct:.1f}% — within post-IndexNow "
+                    f"revalidation window (deduction suppressed)"
+                )
+            else:
+                score -= 5
+                reasons.append(
+                    f"-5: Googlebot redirect rate {pct:.1f}% (>{int(REDIRECT_RATE_WARN_THRESHOLD * 100)}%)"
+                )
 
     # Sitemap fetched at all by Googlebot?
     sitemap_hits = 0
@@ -1438,14 +1721,22 @@ def _fmt_latency(seconds: float) -> str:
 
 
 def render_health_score(agg: Aggregate, fmt: str,
-                        latency_threshold_ms: int = 1000) -> str:
-    score, verdict, reasons = compute_health_score(agg, latency_threshold_ms)
+                        latency_threshold_ms: int = 1000,
+                        post_indexnow_window_hours: int = POST_INDEXNOW_WINDOW_HOURS_DEFAULT) -> str:
+    score, verdict, reasons = compute_health_score(
+        agg, latency_threshold_ms, post_indexnow_window_hours
+    )
     out = [section_header("Googlebot Crawl Health Score", fmt)]
     out.append(f"Score: {score}/100")
     out.append(f"Verdict: {verdict}")
     if reasons:
+        # v1.7: a reasons entry can be either a deduction (e.g. "-5:
+        # ...") or an INFO note (suppressed deduction). Label the list
+        # to match what's actually in it.
+        has_deduction = any(r.startswith("-") for r in reasons)
+        label = "Deductions:" if has_deduction else "Notes:"
         out.append("")
-        out.append("Deductions:")
+        out.append(label)
         for r in reasons:
             out.append(f"  {r}")
     else:
@@ -1631,6 +1922,80 @@ def render_probe_summary(agg: Aggregate, fmt: str) -> str:
     out.append("")
     out.append("Use --show-security-probes to include these in the 404 report.")
     return "\n".join(out) + "\n"
+
+
+def render_spoof_detection(agg: Aggregate, fmt: str,
+                           show_spoof_detail: bool = False) -> str:
+    """v1.7: Suspected UA-Spoof Detection section.
+
+    Renders the second-stage classification results: requests whose UA
+    looked like a major browser but whose path + zero-referrer
+    combination is incompatible with a real browser session. The
+    section is suppressed entirely when no spoof entries were observed.
+
+    show_spoof_detail (from --show-spoof-detail) appends a full
+    per-request listing after the summary. The default summary shows
+    UA-label counts and per-IP path-fetched annotations.
+    """
+    if agg.spoof_count == 0:
+        return ""
+    unique_ips = len(agg.spoof_ip_observations)
+    out = [section_header("Suspected UA-Spoof Detection", fmt)]
+    out.append(
+        f"{agg.spoof_count} requests across {unique_ips} unique IPs exhibited "
+        f"browser-UA + sitemap-fetch behaviour"
+    )
+    out.append("that is incompatible with human browsing sessions.")
+    out.append("")
+
+    out.append("Top spoofed UA strings:")
+    for label, count in agg.spoof_ua_summary.most_common(10):
+        out.append(f"  {count:>4} × {label}")
+    out.append("")
+
+    # Annotate each top IP with the paths it fetched. Multiple paths
+    # per IP collapse to a comma-separated list capped at 3 paths to
+    # keep the line readable.
+    out.append("Top source IPs:")
+    ip_counts = Counter({ip: len(obs) for ip, obs in agg.spoof_ip_observations.items()})
+    for ip, count in ip_counts.most_common(5):
+        observations = agg.spoof_ip_observations[ip]
+        path_summary = _format_spoof_ip_paths(observations)
+        out.append(f"  {count:>4} requests from {ip:<22} (fetched {path_summary})")
+
+    if show_spoof_detail and agg.spoof_entries:
+        out.append("")
+        out.append("Per-request detail:")
+        for e in agg.spoof_entries:
+            ts = e.ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            out.append(
+                f"  {ts}  {e.ip:<22}  {e.status}  {e.path}  "
+                f"[{_short_ua_label(e.ua)}]"
+            )
+    else:
+        out.append("")
+        out.append("Use --show-spoof-detail to include full per-request listing.")
+    return "\n".join(out) + "\n"
+
+
+def _format_spoof_ip_paths(observations: list[tuple[str, int]]) -> str:
+    """Render the path-fetched annotation for a spoof-IP row.
+
+    observations is the list of (path, status) tuples recorded for one
+    IP. The renderer picks up to three distinct paths, each annotated
+    with its status when non-200, so the operator sees both the path
+    and the response without needing the detail listing.
+    """
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for path, status in observations:
+        if path in seen_set:
+            continue
+        seen.append(f"{path} {status}" if status != 200 else path)
+        seen_set.add(path)
+        if len(seen) >= 3:
+            break
+    return ", ".join(seen)
 
 
 def render_framework_probes(agg: Aggregate, fmt: str) -> str:
@@ -1887,8 +2252,11 @@ def render_log_format_recommendation(agg: Aggregate, fmt: str) -> str:
 
 
 def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None,
-                latency_threshold_ms: int = 1000) -> str:
-    score, verdict, reasons = compute_health_score(agg, latency_threshold_ms)
+                latency_threshold_ms: int = 1000,
+                post_indexnow_window_hours: int = POST_INDEXNOW_WINDOW_HOURS_DEFAULT) -> str:
+    score, verdict, reasons = compute_health_score(
+        agg, latency_threshold_ms, post_indexnow_window_hours
+    )
     _sc_score, _sc_verdict, _sc_reasons, _sc_total = compute_search_crawler_score(agg)
 
     summary = {
@@ -2040,6 +2408,28 @@ def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None
     if depth_payload:
         payload["ai_crawler_depth_preference"] = depth_payload
 
+    # v1.7: Suspected UA-Spoof Detection structured output. Omitted when
+    # no spoof entries were observed, so combined-format runs against
+    # logs containing no browser-UA + sitemap-fetch combinations
+    # produce identical JSON to v1.6.
+    if agg.spoof_count > 0:
+        payload["suspected_ua_spoof"] = {
+            "total": agg.spoof_count,
+            "unique_ips": len(agg.spoof_ip_observations),
+            "top_ua_labels": agg.spoof_ua_summary.most_common(10),
+            "top_ips": [
+                {
+                    "ip": ip,
+                    "requests": len(observations),
+                    "paths": sorted({path for path, _ in observations})[:5],
+                }
+                for ip, observations in sorted(
+                    agg.spoof_ip_observations.items(),
+                    key=lambda kv: -len(kv[1]),
+                )[:5]
+            ],
+        }
+
     return json.dumps(payload, indent=2, sort_keys=True, default=str)
 
 
@@ -2117,6 +2507,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="p95 latency threshold in milliseconds for the "
                         "Googlebot health-score deduction (default: 1000). "
                         "Skipped when no $request_time data is available.")
+    p.add_argument("--post-indexnow-window-hours", type=int,
+                   default=POST_INDEXNOW_WINDOW_HOURS_DEFAULT,
+                   dest="post_indexnow_window_hours",
+                   help="v1.7: hours after the latest log entry within which "
+                        "elevated Googlebot redirect rates (25-50%%) are "
+                        "treated as post-IndexNow revalidation and the "
+                        "health-score deduction is suppressed. Above 50%% "
+                        "the deduction always applies. Default: "
+                        f"{POST_INDEXNOW_WINDOW_HOURS_DEFAULT}.")
+    p.add_argument("--show-spoof-detail", action="store_true",
+                   dest="show_spoof_detail",
+                   help="v1.7: include the full per-request listing in the "
+                        "Suspected UA-Spoof Detection section. Default is "
+                        "summary only (UA-label counts + top source IPs).")
     return p.parse_args(argv)
 
 
@@ -2182,7 +2586,9 @@ def filter_for_bot(agg: Aggregate, bot_filter: str) -> Aggregate:
 def render_report(agg: Aggregate, args: argparse.Namespace,
                   verification: dict[str, bool] | None) -> str:
     if args.format == "json":
-        return render_json(agg, args.top, verification, args.latency_threshold_ms)
+        return render_json(agg, args.top, verification,
+                           args.latency_threshold_ms,
+                           args.post_indexnow_window_hours)
 
     fmt = args.format
     parts = [
@@ -2197,10 +2603,15 @@ def render_report(agg: Aggregate, args: argparse.Namespace,
         render_section_breakdown(agg, fmt),
         render_ai_crawlers(agg, fmt, args.bot),
         render_deploy_anomalies(agg, fmt),
-        render_health_score(agg, fmt, args.latency_threshold_ms),
+        render_health_score(agg, fmt, args.latency_threshold_ms,
+                            args.post_indexnow_window_hours),
         render_search_crawler_score(agg, fmt),
         render_response_latency(agg, fmt),
         render_probe_summary(agg, fmt),
+        # v1.7: Suspected UA-Spoof Detection sits immediately after the
+        # security-probe summary so the two noise-class sections are
+        # adjacent in the report.
+        render_spoof_detection(agg, fmt, args.show_spoof_detail),
         render_framework_probes(agg, fmt),
         render_bad_request_noise(agg, fmt),
         render_malformed_samples(agg, fmt),
@@ -2278,7 +2689,9 @@ def main(argv: list[str] | None = None) -> int:
         #   0 = clean
         anomalies = detect_deploy_anomalies(agg)
         severities = {f.severity for f in anomalies}
-        gb_score, _, _ = compute_health_score(agg, args.latency_threshold_ms)
+        gb_score, _, _ = compute_health_score(
+            agg, args.latency_threshold_ms, args.post_indexnow_window_hours
+        )
         sc_score, _, _, _ = compute_search_crawler_score(agg)
 
         non_google_search_404s = sum(

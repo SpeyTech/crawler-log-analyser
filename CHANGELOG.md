@@ -7,6 +7,247 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## v1.7.0 — 2026-05-14
+
+Three operational improvements driven by two days of running v1.6.0
+against the speytech.com production log. None are urgent. All are
+bounded — they reduce daily-report noise, increase signal quality, or
+surface a class of traffic the analyser previously missed.
+
+### Added
+
+- **Four crawlers promoted out of `GenericBot`** into named entries:
+
+  | Name | Domain | Notes |
+  |------|--------|-------|
+  | DotBot | Moz backlink crawler | SEO tool, not user-facing search |
+  | Qwantbot | Qwant search engine | European / French regional search |
+  | SeznamBot | Seznam.cz | Czechia's major search engine |
+  | SERankingBacklinksBot | SE Ranking | SEO tool, same category as DotBot |
+
+  All four classify with `is_ai=False`. Deliberately **not** added to
+  `SEARCH_CRAWLERS` — the broader search-crawler health score targets
+  major user-facing search engines, and including SEO tools and
+  regional crawlers would dilute that signal.
+
+  Operator-visible effect: the four bots appear as named rows in the
+  Status Code Breakdown By Bot section instead of being aggregated into
+  GenericBot. The `GenericBot` count drops accordingly.
+
+- **UA-spoof behavioural detection** — a new classification
+  `SuspectedUASpoof` fires when a request matches all three of:
+
+  1. UA matches a major browser engine (Firefox / Chrome / Safari /
+     Edg under `Mozilla/5.0`)
+  2. Referrer is empty (`-` or absent)
+  3. Path is in the SEO infrastructure set (`/robots.txt`,
+     `/sitemap.xml`, `/sitemap-0.xml`, `/sitemap-index.xml`,
+     `/sitemap.txt`, `/llms.txt`, `/llms-full.txt`)
+
+  The combination is incompatible with human browsing: real browser
+  sessions don't navigate directly to `/sitemap-0.xml` with no
+  referrer. The override fires only when the first-stage classifier
+  returned `Empty-UA`, `Human/Other`, or `GenericBot` — requests
+  matching a named bot pattern are left alone.
+
+  `/rss.xml` is deliberately excluded from the trigger set; some
+  legitimate RSS readers spoof browser UAs to bypass anti-bot measures.
+
+  Motivation: the May 13 Firefox-UA analysis surfaced five requests
+  from five distinct IPs, each spoofing a different Firefox version,
+  each fetching a sitemap-class path with empty referrer. v1.6 bucketed
+  these as anonymous browser traffic and silently dropped them from
+  the AI Crawler Report, Status Code Breakdown, and most other
+  analyses.
+
+- **New report section: Suspected UA-Spoof Detection.** Rendered
+  immediately after "Suppressed Security Probe Noise" when spoof
+  traffic is observed:
+
+  ~~~
+  Suspected UA-Spoof Detection
+  ────────────────────────────
+
+  4 requests across 4 unique IPs exhibited browser-UA + sitemap-fetch behaviour
+  that is incompatible with human browsing sessions.
+
+  Top spoofed UA strings:
+       1 × Firefox/133.0
+       1 × Firefox/126.0
+       1 × Firefox/124.0
+       1 × Chrome/120.0.0.0
+
+  Top source IPs:
+       1 requests from 5.255.103.97         (fetched /sitemap.txt)
+       1 requests from 14.169.63.28         (fetched /sitemap-0.xml)
+       1 requests from 198.51.100.7         (fetched /sitemap-index.xml)
+       1 requests from 203.0.113.42         (fetched /llms.txt)
+
+  Use --show-spoof-detail to include full per-request listing.
+  ~~~
+
+  The section is suppressed entirely when no spoof entries are
+  observed.
+
+- **`--show-spoof-detail`** appends a full per-request listing
+  (timestamp, IP, status, path, UA label) to the spoof detection
+  section. Useful for triaging specific IPs.
+
+- **`--post-indexnow-window-hours N`** (default 4) configures the
+  redirect-rate suppression window. See "Changed" below for the
+  scoring-rule update this flag controls.
+
+- **Severe redirect-rate tier at ≥50%** in the Googlebot Crawl Health
+  Score. Above this rate the deduction always fires regardless of
+  window — the rate is incompatible with normal post-IndexNow
+  revalidation and indicates a genuine configuration loop.
+
+- **New JSON key `suspected_ua_spoof`** with structured spoof data:
+
+  ~~~json
+  "suspected_ua_spoof": {
+    "total": 4,
+    "unique_ips": 4,
+    "top_ua_labels": [["Firefox/133.0", 1], ["Firefox/126.0", 1]],
+    "top_ips": [
+      {
+        "ip": "5.255.103.97",
+        "requests": 1,
+        "paths": ["/sitemap.txt"]
+      }
+    ]
+  }
+  ~~~
+
+  Key is omitted entirely (not `null` or `{}`) when no spoof entries
+  are observed.
+
+### Changed
+
+- **Googlebot Crawl Health Score redirect-rate deduction is now
+  window-aware between 25% and 50%.** The previous fixed-threshold
+  deduction at >25% was producing false negatives during post-IndexNow
+  revalidation bursts — Googlebot legitimately fetches every redirect
+  rule aggressively after a freshness-signal ping, pushing the rate
+  above 25% while every redirect is resolving cleanly.
+
+  v1.7.0 bands the redirect rate as:
+
+  | Rate | Behaviour |
+  |------|-----------|
+  | < 25% | no deduction (unchanged) |
+  | 25–50% in post-IndexNow window | no deduction, INFO note rendered |
+  | 25–50% outside window | -5 deduction (unchanged) |
+  | ≥ 50% | -5 deduction with "(severe)" suffix, ignores window |
+
+  The post-IndexNow window is detected via a proxy: the first-seen
+  timestamps of URLs already qualifying as high-traffic redirects
+  (`canonical_loop` count ≥ 3, < 50 — i.e. working redirects under
+  heavy crawler load). When one or more such URLs first appeared
+  within `--post-indexnow-window-hours` of `agg.latest`, the analyser
+  infers that Googlebot is mid-revalidation sweep.
+
+  In the suppression case, the reasons list contains an INFO line
+  instead of a deduction:
+
+  ~~~
+  INFO: Googlebot redirect rate 27.4% — within post-IndexNow revalidation window (deduction suppressed)
+  ~~~
+
+  Calibrated empirically from the 2026-05-14 production data: 407
+  redirects / 1,488 total = 27.4% Googlebot redirect rate, every
+  redirect confirmed working by seo-validator v7.4 section 21, all
+  driven by the morning's IndexNow ping. Under v1.6.0 this scored
+  95/100 with a misleading -5 deduction. Under v1.7.0 it scores
+  100/100 with an INFO note documenting the suppression.
+
+- **Health-score section heading switches from "Deductions:" to
+  "Notes:"** when the reasons list contains no actual deductions
+  (i.e. only INFO suppression notes). Cosmetic, but reads honestly:
+  the previous label was misleading in the new INFO-only case.
+
+### Preserved
+
+- All v1.6.0 CLI invocations continue to work unchanged. The two new
+  flags (`--post-indexnow-window-hours`, `--show-spoof-detail`) are
+  additive with sensible defaults.
+
+- Default text output is byte-identical to v1.6.0 for any log that
+  doesn't contain v1.7-triggering traffic. Verified by md5sum
+  comparison on a clean 4-line synthetic log: v1.6 and v1.7 produce
+  identical output (md5: `e3b5fdd5002dcb79680005fe57bcc6e8`).
+
+- JSON output adds one conditional top-level key (`suspected_ua_spoof`).
+  v1.6.0 consumers that ignore it see identical JSON. The key is
+  omitted entirely when no spoof entries are observed.
+
+- The redirect-rate logic produces strictly more favourable scores in
+  post-IndexNow windows. No regression for any input — the only
+  behaviour change is suppression of false-positive deductions.
+
+- `SuspectedUASpoof` entries are excluded from `crawler_404s`, the
+  Googlebot Crawl Health Score cohort, and the broader Search Crawler
+  Health Score cohort. Spoof traffic is noise, not search signal;
+  including it would skew the per-URL 404 view and the score
+  computations. Spoof entries do appear in the Status Code Breakdown
+  By Bot, so operators retain visibility into the volume.
+
+- Zero new dependencies. The program remains a single-file Python
+  stdlib script.
+
+### Notes
+
+The v1.7 requirements document captured three confirmed features
+(named bot patterns, UA-spoof detection, post-deploy redirect rate
+handling) and four deferred items:
+
+- **Config file defaults** for operator IPs — UX improvement, deferred
+  to v1.8 as a separate behaviour-change release.
+- **CSP log parsing** — different log format, different data source;
+  belongs in its own tool (filed as v1.0 candidate for a separate
+  `csp-log-analyser` script).
+- **Build determinism check** — operationally adjacent to crawler
+  analysis but better hosted in seo-validator.
+- **IndexNow URL set dump** — interesting but not action-driving;
+  defer until a clear operational reason emerges.
+
+Two known false-positive cases for the UA-spoof detector documented
+for users:
+
+- Pre-rendering tools (Vercel, Netlify, etc.) that use browser UAs and
+  fetch sitemaps as part of build pipelines would be classified as
+  spoofers. False-positive rate is low; pre-rendering happens from
+  known cloud IPs.
+- Operator-issued `curl` tests with custom browser UA strings against
+  sitemap paths will be flagged. This is by design — the request
+  shape is bot-like, and the existing `--ignore-source-ip` flag does
+  not apply (that flag affects probe classification, not spoof
+  classification).
+
+### Verification
+
+- 36 synthetic tests pass against the requirements doc test matrix:
+  8 tests for Feature 1 (named bot patterns + SEARCH_CRAWLERS guard),
+  14 tests for Feature 2 (UA-spoof detection across the 6 requirements
+  scenarios + 5 production fixtures + 3 edge cases),
+  9 tests for Feature 3 (redirect-rate tier + window + edge cases),
+  3 tests for `in_post_indexnow_window` configurability,
+  2 tests for cross-cutting backward compatibility.
+
+- End-to-end smoke test against a synthetic 13-line log mixing all
+  v1.7 traffic classes produces the expected report sections with
+  correct cross-counting.
+
+- Backward compatibility confirmed by md5sum: text output for a
+  combined-format log with no v1.7-triggering traffic is byte-identical
+  to v1.6.0 output for the same input. JSON output for the same log
+  omits the `suspected_ua_spoof` key entirely, producing identical
+  schema to v1.6.0.
+
+- Verification recipe in `docs/VERIFICATION-v1.7.0.md`.
+
+---
+
 ## v1.6.0 — 2026-05-13
 
 Two operational improvements driven by two days of running v1.5.0 against
