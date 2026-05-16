@@ -19,6 +19,35 @@ v1.9 adds three "explained absence" features:
   - Framework probe opacity signal (positive framing when all probes
     404, exposure warning when any 2xx)
 
+v1.10 adds rotational bot-identity detection. The v1.7 spoof check
+catches behavioural spoofing (browser-UA on sitemap-class paths with
+no referrer). It does not catch the pattern observed in production on
+2026-05-16, where a single attacker IP claimed five distinct named-bot
+identities (Googlebot, GPTBot, Baiduspider, ClaudeBot, YandexBot)
+within a 60-second window while probing /.env, /.git/config,
+/config.json, /actuator/env, and similar paths. No legitimate crawler
+operates under multiple identities from a single egress point. v1.10
+classifies these requests as SuspectedBotIdentityRotation as a
+second-stage post-aggregation override, surfaces them in their own
+report section, and excludes them from the real-crawler 404 list and
+the Googlebot / Search Crawler health-score cohorts so they do not
+mask or distort genuine SEO signal.
+
+v1.10.1 tightens two false-positive failure modes surfaced by the
+v1.10.0 production deployment on the 2026-05-16 axilog.io seo log:
+trailing-slash variants of trigger paths (/api/env/, /api/config/)
+were slipping the rotation trigger filter, and rotation 404s on
+non-probe trigger paths were inflating the deploy-window burst
+counter even after reattribution.
+
+v1.10.2 closes a third leak from the same production verification:
+3xx rotation entries (nginx trailing-slash redirects on the no-slash
+form of trigger paths) stayed attributed to their claimed named-bot
+identity in the Redirect Analysis section even after Status Code
+Breakdown had unified them under SuspectedBotIdentityRotation. The
+override now migrates agg.redirects and agg.redirect_attribution
+alongside the other counters so the two views agree.
+
 Usage:
     python3 crawler_log_analyser.py /var/log/nginx/access.log
     python3 crawler_log_analyser.py /var/log/nginx/access.log* --format markdown --output report.md
@@ -28,13 +57,13 @@ Usage:
 Requires: Python 3.11+ (uses stdlib tomllib for config-file parsing).
 No external dependencies.
 
-Version: 1.9.0
+Version: 1.10.2
 Author: William Murray, SpeyTech
 """
 
 from __future__ import annotations
 
-__version__ = "1.9.1"
+__version__ = "1.10.2"
 
 import argparse
 import gzip
@@ -194,6 +223,163 @@ SPOOF_OVERRIDE_CANDIDATES: frozenset[str] = frozenset({
 # summary counters still record everything; only the detail listing is
 # truncated.
 SPOOF_DETAIL_CAP = 200
+
+# v1.10 rotational bot-identity detection.
+#
+# On 2026-05-16 a single attacker IP (5.255.104.83) claimed five distinct
+# named-bot identities (Googlebot, GPTBot, Baiduspider, ClaudeBot,
+# YandexBot) within a ~60-second window while probing /.env variants,
+# /.git/config, /config.json, /actuator/env, and similar paths across
+# speytech.com and axilog.io. The v1.9 nginx-probe jail neutralises this
+# at the network layer, but the analyser surfaced these as legitimate
+# named-crawler 404s, deducting -10 from the broader search-crawler
+# health score and polluting the real-crawler 404 list.
+#
+# v1.10 introduces SuspectedBotIdentityRotation, applied as a second-stage
+# post-aggregation override. A request is reclassified when:
+#   - The first-stage classifier returned a named bot in
+#     ROTATION_OVERRIDE_CANDIDATES (real crawlers that an attacker would
+#     plausibly try to mimic)
+#   - The source IP was observed under N>=ROTATION_MIN_IDENTITIES distinct
+#     named-bot UAs within ROTATION_WINDOW_MINUTES_DEFAULT minutes
+#   - The request path is in ROTATION_TRIGGER_PATHS or matches
+#     SECURITY_PROBE_PATTERNS
+#
+# Rotation entries are excluded from crawler_404s, the Googlebot health
+# cohort, and the broader Search Crawler Health Score, but remain visible
+# in the Status Code Breakdown By Bot and in the dedicated rotation
+# section. This mirrors v1.7's SuspectedUASpoof handling exactly.
+ROTATION_DETECTION_NAME = "SuspectedBotIdentityRotation"
+
+# Default window over which a single IP must claim multiple identities
+# for the rotation override to fire. Five minutes is the empirical
+# starting point — the 2026-05-16 production rotation completed in
+# ~60 seconds; the wider window accommodates slower probe campaigns.
+# Operators can tighten or widen via --rotation-window-minutes.
+ROTATION_WINDOW_MINUTES_DEFAULT = 5
+
+# Minimum distinct named-bot identities observed from a single IP within
+# the window before the override fires. Three is the floor below which
+# the signal is too weak: two identities could plausibly be a single
+# operator running two crawlers on overlapping ranges; three or more
+# from one egress is unambiguously inauthentic.
+ROTATION_MIN_IDENTITIES_DEFAULT = 3
+
+# Per-IP cap on the rotation candidate log. Real attacker rotation
+# bursts produce 5-20 requests; 100 leaves comfortable headroom while
+# bounding worst-case memory under a deliberately noisy attacker.
+# Beyond this count the IP's earlier candidates are kept and later
+# ones are dropped; the rotation will already have been detected from
+# the first ROTATION_LOG_CAP_PER_IP entries.
+ROTATION_LOG_CAP_PER_IP = 100
+
+# Bound on the number of full LogEntry rows stored for
+# --show-rotation-detail. Parallel to SPOOF_DETAIL_CAP and the same
+# rationale: summary counters record everything; only the detail
+# listing is truncated.
+ROTATION_DETAIL_CAP = 200
+
+# Bot classifications eligible for second-stage rotation override.
+# Deliberately the set of real, named crawlers whose identities an
+# attacker would plausibly try to claim. GenericBot, UnknownBot,
+# Empty-UA, Human/Other, and SuspectedUASpoof are excluded — rotational
+# identity claims are interesting only when the attacker is specifically
+# pretending to be a *known trusted* crawler. SuspectedUASpoof requests
+# are already classified as inauthentic noise; they don't need a second
+# inauthenticity label, and including them would force ordering
+# decisions between the two overrides.
+ROTATION_OVERRIDE_CANDIDATES: frozenset[str] = frozenset({
+    "Googlebot",
+    "Googlebot-Image",
+    "Bingbot",
+    "YandexBot",
+    "BaiduSpider",
+    "DuckDuckBot",
+    "Applebot",
+    "OAI-SearchBot",
+    "ChatGPT-User",
+    "GPTBot",
+    "ClaudeBot",
+    "Claude-SearchBot",
+    "Claude-User",
+    "PerplexityBot",
+    "MistralBot",
+    "Bytespider",
+    "FacebookExternalHit",
+    "LinkedInBot",
+    "TwitterBot",
+    "AhrefsBot",
+    "SemrushBot",
+    "MJ12bot",
+    "Amazonbot",
+    "PetalBot",
+})
+
+# Additional trigger paths for the rotation override. The v1.9 nginx
+# probe jail catches these at the network layer; v1.10 surfaces them
+# in the analyser report so the operator sees the attack pattern as
+# well as the block. Path-matched exactly (no regex) — the regex
+# matching for security-probe-shaped paths goes through the existing
+# is_security_probe() helper.
+ROTATION_TRIGGER_PATHS: frozenset[str] = frozenset({
+    "/config.json",
+    "/secrets.json",
+    "/appsettings.json",
+    "/application.json",
+    "/credentials.json",
+    "/actuator",
+    "/actuator/env",
+    "/actuator/heapdump",
+    "/api/env",
+    "/api/config",
+    "/api/secrets",
+    "/api/credentials",
+    "/api/admin",
+    "/api/debug",
+    "/api/users",
+    "/api/auth",
+    "/api/tokens",
+    "/api/keys",
+    "/vendor/composer/installed.json",
+})
+
+
+def is_rotation_trigger_path(path: str) -> bool:
+    """True if the path is eligible for the rotation override.
+
+    A path qualifies if it is in the exact-match ROTATION_TRIGGER_PATHS
+    set OR matches the existing SECURITY_PROBE_PATTERNS regex set. The
+    rotation pattern is most meaningful when the attacker is probing
+    sensitive endpoints; rotating identities on a homepage fetch is
+    not interesting (and almost certainly never happens, since real
+    crawlers don't fetch homepages eight times under five UAs).
+
+    Trailing slashes are normalised away before the trigger-set check.
+    The v1.10.0 production run on axilog.io captured a real attacker
+    hitting `/api/env/` and `/api/config/` (trailing-slash variants)
+    in the same rotation burst as `/api/env` and `/api/config`. Without
+    normalisation those two variants would slip through the trigger
+    filter, leaving their 404s in the real-crawler 404 list even
+    though the same IP was clearly rotating. The trigger paths are
+    canonicalised without a trailing slash by convention; normalising
+    the input path before the set lookup makes the convention work
+    regardless of which form nginx logged. The "/" root path is
+    preserved (rstrip on "/" returns "") so no false trigger fires
+    for homepage fetches.
+    """
+    if not path:
+        return False
+    # Strip query string before normalising — a request to
+    # /config.json?x=1 is still a probe of /config.json. Then strip
+    # a single trailing slash, but only when the path is not literally
+    # "/" (root).
+    clean = path.split("?", 1)[0]
+    if len(clean) > 1 and clean.endswith("/"):
+        clean = clean[:-1]
+    if clean in ROTATION_TRIGGER_PATHS:
+        return True
+    return is_security_probe(path)
+
 
 # v1.7 post-IndexNow redirect-rate window. After an IndexNow ping
 # Googlebot does aggressive recheck sweeps that legitimately push the
@@ -1358,6 +1544,63 @@ class Aggregate:
     # the site-context output would be misleading either way.
     host: str | None = None
 
+    # --- v1.10 rotational bot-identity detection ----------------------------
+    #
+    # Populated during aggregation when an entry's first-stage
+    # classification lands in ROTATION_OVERRIDE_CANDIDATES AND the path
+    # is rotation-eligible (per is_rotation_trigger_path). The post-
+    # aggregation override pass (apply_rotation_override) then walks
+    # ip_identity_log per IP, identifies clusters where >= N distinct
+    # identities appeared within the configured window, and re-attributes
+    # the matched entries: bot_status decrements the original named bot
+    # and increments SuspectedBotIdentityRotation; crawler_404s drops the
+    # path/bot pair if it was a rotation 404; bot_ips removes the IP from
+    # the original bot's set. The rotation_* summary fields are populated
+    # in the same pass for the renderer to consume.
+    #
+    # ip_identity_log: per-IP ordered list of (timestamp, classified_bot,
+    # path, status, original_entry) records. Bounded per-IP at
+    # ROTATION_LOG_CAP_PER_IP to keep memory finite under a deliberately
+    # noisy attacker. The original_entry reference is held so the override
+    # pass can re-attribute counters and append to rotation_entries.
+    ip_identity_log: dict[str, list[tuple[datetime, str, str, int, LogEntry]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+
+    # Summary fields populated by apply_rotation_override(). All remain
+    # at their zero/empty defaults when no rotation is detected, which
+    # is the exact condition under which the rotation report section
+    # and JSON key are suppressed.
+    rotation_count: int = 0
+    # Per-IP request count for rotation entries. Ordered by frequency
+    # at report time.
+    rotation_ip_requests: Counter[str] = field(default_factory=Counter)
+    # Per-IP set of identities claimed during rotation. Sorted list at
+    # report time for deterministic output.
+    rotation_ip_identities: dict[str, set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    # Per-IP set of paths probed during rotation, deduplicated.
+    rotation_ip_paths: dict[str, set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    # Frequency of identity-tuple combinations across IPs. The tuple is
+    # the sorted set of identities a single IP cycled through. Each IP
+    # contributes exactly one entry. Useful for spotting when multiple
+    # attacker IPs share a rotation pattern (likely the same toolkit).
+    rotation_identity_combinations: Counter[tuple[str, ...]] = field(
+        default_factory=Counter
+    )
+    # Per-path request count for rotation entries (across all rotating IPs).
+    rotation_path_counts: Counter[str] = field(default_factory=Counter)
+    # Bounded list of full log entries for --show-rotation-detail.
+    rotation_entries: list[LogEntry] = field(default_factory=list)
+    # The window and threshold actually used to compute the rotation
+    # classification. Echoed verbatim into the JSON output so a
+    # consumer can confirm which settings produced the result.
+    rotation_window_minutes: int = ROTATION_WINDOW_MINUTES_DEFAULT
+    rotation_min_identities: int = ROTATION_MIN_IDENTITIES_DEFAULT
+
 
 def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
               show_security_probes: bool,
@@ -1482,6 +1725,23 @@ def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
             if len(agg.spoof_entries) < SPOOF_DETAIL_CAP:
                 agg.spoof_entries.append(e)
 
+        # v1.10: rotation-candidate capture. Stash entries whose first-
+        # stage classification is a named bot in the override candidate
+        # set AND whose path is rotation-eligible. The actual rotation
+        # detection runs after aggregation completes
+        # (apply_rotation_override). Capture is bounded per-IP at
+        # ROTATION_LOG_CAP_PER_IP. Ignored source IPs (operator self-
+        # tests, etc.) are excluded — mirroring v1.5's probe-noise
+        # filtering — because an operator's own scripted curl tests of
+        # multiple bot UAs are exactly the false-positive shape this
+        # override is designed to catch in attacker traffic.
+        if (e.bot in ROTATION_OVERRIDE_CANDIDATES
+                and is_rotation_trigger_path(e.path)
+                and e.ip not in ignored_probe_ips):
+            ip_log = agg.ip_identity_log[e.ip]
+            if len(ip_log) < ROTATION_LOG_CAP_PER_IP:
+                ip_log.append((e.ts, e.bot, e.path, e.status, e))
+
         # v1.3: latency tracking from seo_crawl format.
         if e.request_time is not None:
             agg.has_latency_data = True
@@ -1513,6 +1773,395 @@ def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
         del agg.slowest_entries[10:]
 
     return agg
+
+
+# ---------------------------------------------------------------------------
+# v1.10 rotational bot-identity detection (post-aggregation override)
+# ---------------------------------------------------------------------------
+
+
+def detect_rotation_indices(
+    entries: list[tuple[datetime, str, str, int, "LogEntry"]],
+    window: timedelta,
+    min_identities: int,
+) -> set[int]:
+    """Return the set of entry indices that belong to a rotation cluster.
+
+    Walks a sliding window over the per-IP identity log. For each
+    starting index i, the window covers entries[i..k] such that
+    entries[k].ts - entries[i].ts <= window. If the number of distinct
+    identities in that window meets min_identities, every index in the
+    window is added to the rotation set. Overlapping clusters merge
+    naturally — an IP with five identities where the first three are
+    in window-1 and the last three are in window-2 has all five flagged.
+
+    The entries list is assumed to be ordered by timestamp. The
+    aggregation pass appends candidates in stream order, so this is
+    true when the input log is itself in time order (the standard case
+    for an nginx access.log). When time-disordered logs are concatenated
+    we sort defensively in apply_rotation_override before calling this.
+
+    Complexity: O(N^2) worst case per IP, where N is bounded by
+    ROTATION_LOG_CAP_PER_IP. For realistic attacker bursts (5-20
+    requests over a few minutes) the inner loop exits within a handful
+    of iterations because the window check trips quickly.
+    """
+    if len(entries) < min_identities:
+        return set()
+    rotation: set[int] = set()
+    n = len(entries)
+    for i in range(n):
+        window_end = entries[i][0] + window
+        identities: set[str] = set()
+        window_indices: list[int] = []
+        for j in range(i, n):
+            if entries[j][0] > window_end:
+                break
+            identities.add(entries[j][1])
+            window_indices.append(j)
+        if len(identities) >= min_identities:
+            rotation.update(window_indices)
+    return rotation
+
+
+def apply_rotation_override(
+    agg: Aggregate,
+    window_minutes: int = ROTATION_WINDOW_MINUTES_DEFAULT,
+    min_identities: int = ROTATION_MIN_IDENTITIES_DEFAULT,
+) -> None:
+    """Apply the v1.10 SuspectedBotIdentityRotation classification.
+
+    Runs after aggregate() has produced all per-bot counters. Walks
+    agg.ip_identity_log per IP, identifies rotation clusters via the
+    window-walking algorithm, and re-attributes matched entries from
+    their original named-bot classification to ROTATION_DETECTION_NAME.
+
+    The re-attribution touches the same Aggregate fields that the
+    original aggregation pass populated: bot_status, bot_urls,
+    bot_url_status, bot_ips, special_files, crawler_404s,
+    crawler_404_samples, and googlebot_* (if Googlebot was the original
+    classification). After this pass returns, downstream renderers and
+    health-score functions see the rotation entries as
+    SuspectedBotIdentityRotation rather than as their claimed named-bot
+    identity. The Status Code Breakdown By Bot retains volume
+    visibility on the rotation classification; the dedicated rotation
+    section is the primary surface.
+
+    Health-score impact: rotation entries vanish from the Googlebot and
+    Search Crawler cohorts (which read SEARCH_CRAWLERS membership
+    against bot_status). This is the entire point — false-positive
+    attribution of attacker rotation traffic to real crawlers was
+    distorting both scores. Verify on logs containing rotation: the
+    broader cohort score should improve.
+
+    Mutates agg in place. Idempotent only in the trivial sense that
+    rotation entries, once rewritten, no longer match the candidate
+    criteria; do not call this function twice on the same Aggregate
+    with different window parameters expecting a re-run — instead,
+    re-aggregate from the source.
+    """
+    # Record the parameters that were actually applied. JSON output
+    # echoes these so a consumer can confirm which settings produced
+    # the result. Recorded even when no rotation is detected so the
+    # parameters survive in the report regardless of outcome.
+    agg.rotation_window_minutes = window_minutes
+    agg.rotation_min_identities = min_identities
+
+    if not agg.ip_identity_log:
+        return
+
+    window = timedelta(minutes=window_minutes)
+
+    # Collect the rotation entries first, then mutate. This keeps the
+    # detection step and the rewrite step separate, which makes the
+    # logic easier to reason about and avoids the risk of mutating a
+    # field we're still iterating.
+    rotation_entries: list[tuple[str, datetime, str, str, int, LogEntry]] = []
+    # Track per-IP the identity set actually observed in a rotation
+    # cluster so the report's identity list is accurate even when an
+    # IP's identity log contains a mix of in-cluster and out-of-cluster
+    # entries.
+    per_ip_cluster_identities: dict[str, set[str]] = defaultdict(set)
+    per_ip_cluster_paths: dict[str, set[str]] = defaultdict(set)
+
+    for ip, entries in agg.ip_identity_log.items():
+        if len(entries) < min_identities:
+            continue
+        # Defensive sort: aggregation appends in stream order, which is
+        # time-ordered for a normal access.log. If the operator concatenated
+        # logs from multiple sources, the order may not hold, and the
+        # window-walker assumes monotonic time. Sorting is O(N log N) over
+        # the per-IP cap (100) — negligible.
+        entries_sorted = sorted(entries, key=lambda r: r[0])
+        rotation_indices = detect_rotation_indices(
+            entries_sorted, window, min_identities
+        )
+        if not rotation_indices:
+            continue
+        for idx in sorted(rotation_indices):
+            ts, original_bot, path, status, original_entry = entries_sorted[idx]
+            rotation_entries.append(
+                (ip, ts, original_bot, path, status, original_entry)
+            )
+            per_ip_cluster_identities[ip].add(original_bot)
+            per_ip_cluster_paths[ip].add(path)
+
+    if not rotation_entries:
+        return
+
+    # Re-attribute counters and populate the summary fields.
+    for ip, ts, original_bot, path, status, original_entry in rotation_entries:
+        # bot_status: decrement original bot's status, increment rotation's.
+        agg.bot_status[original_bot][status] -= 1
+        if agg.bot_status[original_bot][status] <= 0:
+            del agg.bot_status[original_bot][status]
+        if not agg.bot_status[original_bot]:
+            del agg.bot_status[original_bot]
+        agg.bot_status[ROTATION_DETECTION_NAME][status] += 1
+
+        # bot_urls and bot_url_status: same dance.
+        agg.bot_urls[original_bot][path] -= 1
+        if agg.bot_urls[original_bot][path] <= 0:
+            del agg.bot_urls[original_bot][path]
+        if not agg.bot_urls[original_bot]:
+            del agg.bot_urls[original_bot]
+        agg.bot_urls[ROTATION_DETECTION_NAME][path] += 1
+
+        agg.bot_url_status[original_bot][path][status] -= 1
+        if agg.bot_url_status[original_bot][path][status] <= 0:
+            del agg.bot_url_status[original_bot][path][status]
+        if not agg.bot_url_status[original_bot][path]:
+            del agg.bot_url_status[original_bot][path]
+        if not agg.bot_url_status[original_bot]:
+            del agg.bot_url_status[original_bot]
+        agg.bot_url_status[ROTATION_DETECTION_NAME][path][status] += 1
+
+        # special_files: only present if the path matches the special-file
+        # set, which is unlikely for rotation traffic (probes target
+        # /.env, /config.json, etc. — not /robots.txt or /sitemap.xml).
+        # Handle anyway so the bookkeeping stays consistent.
+        clean_path = path.split("?", 1)[0]
+        if clean_path in SPECIAL_FILES:
+            sf_entry = agg.special_files.get(clean_path, {}).get(original_bot)
+            if sf_entry is not None and sf_entry[status] > 0:
+                sf_entry[status] -= 1
+                if sf_entry[status] <= 0:
+                    del sf_entry[status]
+                if not sf_entry:
+                    del agg.special_files[clean_path][original_bot]
+                agg.special_files[clean_path][ROTATION_DETECTION_NAME][status] += 1
+
+        # crawler_404s: 404 attribution to the original named bot is the
+        # primary distortion this override fixes. Removing rotation
+        # entries here restores accurate "real-crawler 404" counts.
+        if status == 404:
+            if (path in agg.crawler_404s
+                    and original_bot in agg.crawler_404s[path]):
+                agg.crawler_404s[path][original_bot] -= 1
+                if agg.crawler_404s[path][original_bot] <= 0:
+                    del agg.crawler_404s[path][original_bot]
+                if not agg.crawler_404s[path]:
+                    del agg.crawler_404s[path]
+            # Drop any sample held against (path, original_bot). Rotation
+            # entries are deliberately NOT re-added under the rotation
+            # name — the rotation section is the proper surface; the
+            # 404 list is reserved for genuine crawler-visible failures.
+            agg.crawler_404_samples.pop((path, original_bot), None)
+
+        # Deploy-window burst counters: minute_404s and
+        # minute_content_404s. These are the inputs to
+        # detect_deploy_anomalies() and they're populated during
+        # aggregation by:
+        #   if e.status == 404 and not e.is_probe and not e.is_framework:
+        #       agg.minute_404s[minute_bucket] += 1
+        #       if e.category not in {"robots","sitemap","rss","llms","static asset"}:
+        #           agg.minute_content_404s[minute_bucket] += 1
+        # Rotation traffic that landed on a non-probe-regex path
+        # (e.g. /api/env, /api/config, /actuator/env's trailing-slash
+        # variants) bypassed the probe gate and incremented the burst
+        # counter. Production verification on the 2026-05-16 axilog.io
+        # seo log showed exactly this failure mode: five rotation
+        # 404s from 5.255.104.83 triggered a HIGH "Content-404 burst"
+        # finding even though the entries had already been re-
+        # attributed to SuspectedBotIdentityRotation. The override
+        # must decrement the same counters it would have prevented
+        # from being incremented if the rotation had been visible at
+        # aggregation time. The gating conditions mirror aggregate()
+        # exactly so we decrement only what we would have skipped.
+        if (status == 404
+                and not original_entry.is_probe
+                and not original_entry.is_framework):
+            minute_bucket = ts.replace(second=0, microsecond=0)
+            if agg.minute_404s[minute_bucket] > 0:
+                agg.minute_404s[minute_bucket] -= 1
+                if agg.minute_404s[minute_bucket] == 0:
+                    del agg.minute_404s[minute_bucket]
+            if original_entry.category not in {
+                "robots", "sitemap", "rss", "llms", "static asset",
+            }:
+                if agg.minute_content_404s[minute_bucket] > 0:
+                    agg.minute_content_404s[minute_bucket] -= 1
+                    if agg.minute_content_404s[minute_bucket] == 0:
+                        del agg.minute_content_404s[minute_bucket]
+
+        # Redirect attribution: 3xx rotation entries got recorded
+        # under their claimed named-bot identity in agg.redirects and
+        # agg.redirect_attribution during aggregation. The v1.10.2
+        # production verification on the 2026-05-16 axilog.io seo log
+        # showed exactly this leak: three trailing-slash 301s from
+        # `5.255.104.83` (one each under BaiduSpider, ClaudeBot,
+        # PerplexityBot) appeared in the Redirect Analysis section
+        # as if three separate bots had each issued one redirect,
+        # while the Status Code Breakdown correctly showed them
+        # unified as SuspectedBotIdentityRotation: 301 × 3.
+        #
+        # Migrate them: decrement agg.redirects[original_bot][path]
+        # and agg.redirect_attribution[original_bot][path][cause],
+        # increment the same under ROTATION_DETECTION_NAME. The
+        # attribution counter only exists for seo_crawl-format
+        # entries (host/scheme required); combined-format runs skip
+        # the attribution migration but still migrate redirects.
+        #
+        # high_traffic_redirect_first_seen is keyed by path alone and
+        # populated only for canonical_loop causes. Rotation entries
+        # produce trailing_slash causes (the slash-form probes
+        # nginx redirects to canonical-form 404s), so this map is
+        # never touched by rotation traffic and needs no migration.
+        if status in (301, 302, 307, 308):
+            if (path in agg.redirects.get(original_bot, {})
+                    and agg.redirects[original_bot][path] > 0):
+                agg.redirects[original_bot][path] -= 1
+                if agg.redirects[original_bot][path] <= 0:
+                    del agg.redirects[original_bot][path]
+                if not agg.redirects[original_bot]:
+                    del agg.redirects[original_bot]
+                agg.redirects[ROTATION_DETECTION_NAME][path] += 1
+
+            # Attribution migration. The per-cause Counter only
+            # exists for seo_crawl-format entries (cause computed
+            # from $host/$scheme). For combined-format the attribution
+            # path won't have entries to migrate; the .get() chain
+            # below tolerates that without raising.
+            orig_attrib = agg.redirect_attribution.get(original_bot, {})
+            path_causes = orig_attrib.get(path)
+            if path_causes:
+                # Migrate every cause-count to the rotation bucket.
+                # Snapshot first because we mutate the source.
+                for cause, count in list(path_causes.items()):
+                    if count <= 0:
+                        continue
+                    # Decrement one occurrence to mirror the single
+                    # rotation entry; remaining occurrences (if any
+                    # — would only happen if the same path had
+                    # multiple 3xx hits under the same named bot)
+                    # stay attributed to the original bot.
+                    path_causes[cause] -= 1
+                    if path_causes[cause] <= 0:
+                        del path_causes[cause]
+                    agg.redirect_attribution[ROTATION_DETECTION_NAME][path][cause] += 1
+                    break  # one entry, one cause migrated
+                if not path_causes:
+                    del orig_attrib[path]
+                if not orig_attrib:
+                    del agg.redirect_attribution[original_bot]
+
+        # Googlebot-specific tracking. If the original classification was
+        # Googlebot, also strip the entry from the Googlebot timeline
+        # and section counts. Other named bots don't have parallel
+        # per-bot caches, so no additional work is needed for them.
+        if original_bot == "Googlebot":
+            hour_bucket = ts.replace(minute=0, second=0, microsecond=0)
+            if agg.googlebot_hours[hour_bucket] > 0:
+                agg.googlebot_hours[hour_bucket] -= 1
+                if agg.googlebot_hours[hour_bucket] == 0:
+                    del agg.googlebot_hours[hour_bucket]
+            # googlebot_timestamps holds a list, not a counter; remove
+            # one matching entry. The list can contain duplicates for
+            # the same ts, so list.remove() (which removes only the
+            # first match) is correct.
+            try:
+                agg.googlebot_timestamps.remove(ts)
+            except ValueError:
+                pass  # Defensive — should always be present.
+            cat = original_entry.category
+            if agg.googlebot_sections[cat] > 0:
+                agg.googlebot_sections[cat] -= 1
+                if agg.googlebot_sections[cat] == 0:
+                    del agg.googlebot_sections[cat]
+
+        # bot_ips: remove the rotating IP from the original bot's set,
+        # add it under the rotation name. We only remove if no OTHER
+        # entry from the same IP under the same original bot survived
+        # the override — otherwise the legitimate (non-rotation)
+        # appearance of that IP under that bot would be erased.
+        # Conservative approach: rebuild bot_ips after the main loop.
+        agg.bot_ips[ROTATION_DETECTION_NAME].add(ip)
+
+        # Populate summary fields.
+        agg.rotation_count += 1
+        agg.rotation_ip_requests[ip] += 1
+        agg.rotation_path_counts[path] += 1
+        if len(agg.rotation_entries) < ROTATION_DETAIL_CAP:
+            agg.rotation_entries.append(original_entry)
+
+    # Rebuild bot_ips for any original_bot we touched. The simple
+    # approach: for each (ip, original_bot) pair that contributed a
+    # rotation entry, check whether any surviving entry in
+    # bot_url_status[original_bot] still references that IP. If not,
+    # drop the IP from bot_ips[original_bot]. We don't have an inverse
+    # index from (bot, path) -> set(ips), so we approximate by
+    # checking whether any non-rotation entry exists for (ip,
+    # original_bot) at all. The cleanest way: collect (ip,
+    # original_bot) pairs that were entirely rotation; drop those from
+    # bot_ips[original_bot]. A pair is "entirely rotation" when every
+    # entry in agg.ip_identity_log[ip] for original_bot was flagged.
+    rotation_pairs: set[tuple[str, str]] = {
+        (ip, ob) for ip, _ts, ob, _p, _s, _e in rotation_entries
+    }
+    # For each rotating IP, determine which original bots have any
+    # SURVIVING entries in ip_identity_log (i.e. were not in any
+    # rotation cluster). Surviving entries keep the IP attached to
+    # that bot in bot_ips; fully-rotated pairs lose the attachment.
+    for ip, original_bot in rotation_pairs:
+        all_entries = agg.ip_identity_log.get(ip, [])
+        # An entry "survives" if its (ts, bot, path, status) tuple was
+        # not flagged. Re-run the detector logic implicitly: an entry
+        # survives iff it's not in the rotation cluster for this IP.
+        # A simpler proxy: if bot_status[original_bot] no longer
+        # contains any status for which this IP could possibly have
+        # contributed, we can safely drop. But we'd need a per-(bot,
+        # ip) survivor count to know that, and we don't maintain one.
+        #
+        # Practical answer: rotation entries from a given IP are
+        # almost always 100% of that IP's traffic under that named bot
+        # — the rotation pattern is, by definition, the entire reason
+        # the IP appeared under that bot at all. Conservatively
+        # discard the IP from bot_ips[original_bot] only when the
+        # original_bot bucket has been emptied from bot_status. If
+        # bot_status[original_bot] still has entries, leave bot_ips
+        # alone — a stale IP entry in bot_ips for a still-populated
+        # bot is harmless (bot_ips is consumed for --verify-googlebot
+        # and the AI crawler IP summary; a non-zero count under
+        # bot_status is the gate that matters).
+        if original_bot not in agg.bot_status:
+            agg.bot_ips[original_bot].discard(ip)
+            if not agg.bot_ips[original_bot]:
+                del agg.bot_ips[original_bot]
+        # Silence the unused-variable warning for all_entries. We
+        # consulted it implicitly via bot_status above; keeping the
+        # local read makes the intent visible.
+        _ = all_entries
+
+    # Compute per-IP identity sets and identity-combination counter.
+    # rotation_unique_ips is derived at render/JSON time from
+    # len(rotation_ip_requests); no separate cached field is needed.
+    for ip, identities in per_ip_cluster_identities.items():
+        agg.rotation_ip_identities[ip] = identities
+        agg.rotation_ip_paths[ip] = per_ip_cluster_paths[ip]
+        # Identity combination: sorted tuple so two IPs cycling through
+        # the same identities (in any order) hash to the same key.
+        combo = tuple(sorted(identities))
+        agg.rotation_identity_combinations[combo] += 1
 
 
 def _classify_redirect_cause(scheme: str, host: str, path: str) -> str:
@@ -2633,6 +3282,90 @@ def _format_spoof_ip_paths(observations: list[tuple[str, int]]) -> str:
     return ", ".join(seen)
 
 
+def render_rotation_detection(agg: Aggregate, fmt: str,
+                              show_rotation_detail: bool = False) -> str:
+    """v1.10: Rotational Bot-Identity Detection section.
+
+    Surfaces requests reclassified as SuspectedBotIdentityRotation by
+    apply_rotation_override(). A single IP claiming multiple distinct
+    named-bot identities within a short window is incompatible with
+    legitimate crawler operation; this section is the primary surface
+    for that attacker pattern. Suppressed entirely when no rotation
+    entries were observed, matching the v1.7 spoof section's behaviour.
+
+    show_rotation_detail (from --show-rotation-detail) appends a full
+    per-request listing after the summary. The default summary shows
+    top rotating IPs (with their identity sets and probed paths),
+    top identity combinations, and top probed paths.
+    """
+    if agg.rotation_count == 0:
+        return ""
+    unique_ips = len(agg.rotation_ip_requests)
+    out = [section_header("Rotational Bot-Identity Detection", fmt)]
+    out.append(
+        f"{agg.rotation_count} requests across {unique_ips} unique IPs "
+        f"exhibited rotational bot-identity behaviour:"
+    )
+    out.append(
+        "a single IP claiming multiple distinct bot identities within "
+        f"a {agg.rotation_window_minutes}-minute window."
+    )
+    out.append("")
+    out.append(
+        "This pattern is incompatible with legitimate crawler operation. "
+        "Real crawlers"
+    )
+    out.append(
+        "operate under a single consistent identity per egress IP."
+    )
+    out.append("")
+
+    # Top rotating IPs with their identity sets.
+    out.append("Top rotating IPs:")
+    for ip, count in agg.rotation_ip_requests.most_common(5):
+        identities = sorted(agg.rotation_ip_identities.get(ip, set()))
+        identity_summary = ", ".join(identities)
+        ident_count = len(identities)
+        out.append(
+            f"  {count:>4} requests from {ip:<22} "
+            f"({ident_count} identities: {identity_summary})"
+        )
+    out.append("")
+
+    # Top identity combinations. Most_common returns Counter items
+    # ordered by count desc, so the first row is the most prevalent
+    # toolkit signature.
+    if agg.rotation_identity_combinations:
+        out.append("Top rotational identity combinations:")
+        for combo, ip_count in agg.rotation_identity_combinations.most_common(5):
+            combo_label = " + ".join(combo)
+            ip_word = "IPs" if ip_count != 1 else "IP"
+            out.append(f"  {ip_count:>4} {ip_word} cycled: {combo_label}")
+        out.append("")
+
+    # Top probed paths during rotation.
+    if agg.rotation_path_counts:
+        out.append("Top probed paths during rotation:")
+        for path, count in agg.rotation_path_counts.most_common(10):
+            out.append(f"  {count:>4} × {path}")
+
+    if show_rotation_detail and agg.rotation_entries:
+        out.append("")
+        out.append("Per-request detail:")
+        for e in agg.rotation_entries:
+            ts = e.ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            out.append(
+                f"  {ts}  {e.ip:<22}  {e.status}  {e.path}  "
+                f"[claimed: {e.bot}]"
+            )
+    else:
+        out.append("")
+        out.append(
+            "Use --show-rotation-detail to include full per-request listing."
+        )
+    return "\n".join(out) + "\n"
+
+
 def _compute_framework_opacity(agg: Aggregate) -> tuple[bool, list[tuple[str, int]]]:
     """v1.9: classify framework-probe responses.
 
@@ -3161,6 +3894,42 @@ def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None
             ],
         }
 
+    # v1.10: Rotational Bot-Identity Detection structured output. Omitted
+    # when no rotation entries were observed, so logs without the attack
+    # pattern produce JSON byte-identical to v1.9.x for v1.9.x consumers.
+    # The window and threshold are echoed verbatim so a consumer can
+    # confirm which parameters produced the result.
+    if agg.rotation_count > 0:
+        sorted_ips = sorted(
+            agg.rotation_ip_requests.items(), key=lambda kv: -kv[1]
+        )[:10]
+        payload["rotational_bot_identity"] = {
+            "total": agg.rotation_count,
+            "unique_ips": len(agg.rotation_ip_requests),
+            "rotation_window_minutes": agg.rotation_window_minutes,
+            "min_identities_threshold": agg.rotation_min_identities,
+            "top_ips": [
+                {
+                    "ip": ip,
+                    "requests": req_count,
+                    "identities": sorted(agg.rotation_ip_identities.get(ip, set())),
+                    "paths": sorted(agg.rotation_ip_paths.get(ip, set()))[:10],
+                }
+                for ip, req_count in sorted_ips
+            ],
+            "top_identity_combinations": [
+                {
+                    "identities": list(combo),
+                    "ip_count": ip_count,
+                }
+                for combo, ip_count in agg.rotation_identity_combinations.most_common(10)
+            ],
+            "top_paths": [
+                {"path": path, "requests": count}
+                for path, count in agg.rotation_path_counts.most_common(10)
+            ],
+        }
+
     # v1.9: site metadata. Emitted only when both a host was captured
     # (seo_crawl format) and the config has a launch_date for that
     # host. host alone with no launch_date config doesn't justify the
@@ -3290,6 +4059,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="v1.7: include the full per-request listing in the "
                         "Suspected UA-Spoof Detection section. Default is "
                         "summary only (UA-label counts + top source IPs).")
+    # v1.10 rotation-detection flags
+    p.add_argument("--rotation-window-minutes", type=int,
+                   default=ROTATION_WINDOW_MINUTES_DEFAULT,
+                   dest="rotation_window_minutes",
+                   help="v1.10: window (in minutes) over which a single "
+                        "IP must claim multiple bot identities for the "
+                        "rotation override to fire. Default: "
+                        f"{ROTATION_WINDOW_MINUTES_DEFAULT}. Tighten via "
+                        "this flag if false positives emerge from "
+                        "operator-driven multi-UA testing across longer "
+                        "windows.")
+    p.add_argument("--rotation-min-identities", type=int,
+                   default=ROTATION_MIN_IDENTITIES_DEFAULT,
+                   dest="rotation_min_identities",
+                   help="v1.10: minimum distinct named-bot identities a "
+                        "single IP must claim within the window before "
+                        "the rotation override fires. Default: "
+                        f"{ROTATION_MIN_IDENTITIES_DEFAULT}. Two-identity "
+                        "claims are not enough signal — they could "
+                        "plausibly be a shared egress for two real "
+                        "crawlers — so the floor is 3.")
+    p.add_argument("--show-rotation-detail", action="store_true",
+                   dest="show_rotation_detail",
+                   help="v1.10: include the full per-request listing in "
+                        "the Rotational Bot-Identity Detection section. "
+                        "Default is summary only (top rotating IPs, "
+                        "identity combinations, probed paths).")
     # v1.8 config-file flags
     p.add_argument("--config", default=None, metavar="PATH",
                    help="v1.8: explicit path to the config file. "
@@ -3369,6 +4165,20 @@ def filter_for_bot(agg: Aggregate, bot_filter: str) -> Aggregate:
             key = (path, target)
             if key in agg.crawler_404_samples:
                 new.crawler_404_samples[key] = agg.crawler_404_samples[key]
+    # v1.10: preserve rotation-detection state through bot filtering.
+    # The rotation section is a behavioural signal independent of which
+    # named bot the operator is investigating — surface it regardless.
+    # An operator running --bot googlebot still wants to see that
+    # five other identities were claimed from the same IPs.
+    new.rotation_count = agg.rotation_count
+    new.rotation_ip_requests = agg.rotation_ip_requests
+    new.rotation_ip_identities = agg.rotation_ip_identities
+    new.rotation_ip_paths = agg.rotation_ip_paths
+    new.rotation_identity_combinations = agg.rotation_identity_combinations
+    new.rotation_path_counts = agg.rotation_path_counts
+    new.rotation_entries = agg.rotation_entries
+    new.rotation_window_minutes = agg.rotation_window_minutes
+    new.rotation_min_identities = agg.rotation_min_identities
     return new
 
 
@@ -3407,6 +4217,13 @@ def render_report(agg: Aggregate, args: argparse.Namespace,
         # security-probe summary so the two noise-class sections are
         # adjacent in the report.
         render_spoof_detection(agg, fmt, args.show_spoof_detail),
+        # v1.10: Rotational Bot-Identity Detection sits between spoof
+        # and framework probes. Spoof and rotation are both attacker-
+        # noise classes — keeping them adjacent makes it easy for the
+        # operator to compare the two surfaces. Framework probes are a
+        # distinct (often legitimate) fingerprinting category and stay
+        # in their existing position.
+        render_rotation_detection(agg, fmt, args.show_rotation_detail),
         render_framework_probes(agg, fmt),
         render_bad_request_noise(agg, fmt),
         render_malformed_samples(agg, fmt),
@@ -3497,6 +4314,39 @@ def main(argv: list[str] | None = None) -> int:
         agg.probe_count = 0
         agg.probe_paths.clear()
         agg.probe_ips.clear()
+
+    # v1.10: apply the second-stage rotation override after aggregation
+    # has populated all per-bot counters but before filter_for_bot
+    # narrows the report to a single bot family. This ordering matters:
+    # the override re-attributes counters from the original named bots
+    # to SuspectedBotIdentityRotation, so health-score and filtering
+    # logic downstream sees the corrected attribution. Running before
+    # --seo-only is intentional too — rotation traffic should be
+    # surfaced regardless of probe-summary suppression, because it's a
+    # behavioural signal, not a probe-noise tally.
+    #
+    # Validate the CLI thresholds defensively. A non-positive window
+    # would make the rotation set empty; a min_identities below 2
+    # would flag any IP with a single named-bot hit. Both are operator
+    # errors worth surfacing as a stderr warning + reset to defaults
+    # rather than letting the report drift silently.
+    rot_window = args.rotation_window_minutes
+    rot_min = args.rotation_min_identities
+    if rot_window < 1:
+        print(
+            f"warning: --rotation-window-minutes={rot_window} is invalid; "
+            f"using default {ROTATION_WINDOW_MINUTES_DEFAULT}",
+            file=sys.stderr,
+        )
+        rot_window = ROTATION_WINDOW_MINUTES_DEFAULT
+    if rot_min < 2:
+        print(
+            f"warning: --rotation-min-identities={rot_min} is invalid "
+            f"(floor is 2); using default {ROTATION_MIN_IDENTITIES_DEFAULT}",
+            file=sys.stderr,
+        )
+        rot_min = ROTATION_MIN_IDENTITIES_DEFAULT
+    apply_rotation_override(agg, rot_window, rot_min)
 
     agg = filter_for_bot(agg, args.bot)
 

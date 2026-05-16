@@ -7,6 +7,383 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## v1.10.2 — 2026-05-16
+
+Third (and likely final) patch closing a leak surfaced by the v1.10.1
+production verification on the 2026-05-16 axilog.io seo log. The
+Status Code Breakdown correctly unified the day's rotation traffic
+under `SuspectedBotIdentityRotation: 301: 3, 404: 6`, but the
+Redirect Analysis section displayed those three 301s as if three
+separate named bots had each issued one redirect:
+
+~~
+BaiduSpider: 1 redirects
+    1 × /api/config  (1 trailing-slash)
+
+ClaudeBot: 1 redirects
+    1 × /api/env  (1 trailing-slash)
+
+PerplexityBot: 1 redirects
+    1 × /actuator/env  (1 trailing-slash)
+~~
+
+These were the no-slash-form trigger-path probes that nginx
+redirected to canonical-form 404s before the rotation override
+caught the slash-form variants. All three came from the same
+`5.255.104.83` rotation burst; all three should have been unified
+under the rotation classification alongside the 404s.
+
+The v1.10.0 override migrated `bot_status`, `bot_urls`,
+`bot_url_status`, `bot_ips`, `special_files`, `crawler_404s`, and
+the Googlebot-specific caches. It did not migrate `redirects` or
+`redirect_attribution`, so the per-named-bot view of redirects
+remained populated for the rotation entries while the per-named-bot
+view of statuses had been cleared. The two views disagreed.
+
+### Fixed
+
+- **`__version__` bumped from `1.10.1` to `1.10.2`.**
+
+- **3xx rotation entries now migrate `agg.redirects` and
+  `agg.redirect_attribution` alongside the other counters.** The
+  override decrements `agg.redirects[original_bot][path]` for each
+  rotation entry with status in `(301, 302, 307, 308)` and
+  increments the same under `ROTATION_DETECTION_NAME`. The
+  per-cause `agg.redirect_attribution` counter migrates the same
+  way when populated (seo_crawl format only; combined-format inputs
+  have no `host`/`scheme` and therefore no attribution data to
+  migrate — the override tolerates this case via a `.get()` chain
+  rather than raising).
+
+  Verified property: after the override runs, the total 3xx count
+  in `bot_status[ROTATION_DETECTION_NAME]` equals the sum of
+  `redirects[ROTATION_DETECTION_NAME]` across all paths. The
+  Status Code Breakdown and the Redirect Analysis now agree.
+
+### Preserved
+
+- All v1.10.1 behaviour preserved. The two earlier fixes
+  (trailing-slash normalisation in `is_rotation_trigger_path()`
+  and burst-counter decrement in `apply_rotation_override()`)
+  continue to work exactly as before.
+- Default text output remains byte-identical to v1.9.1 for any log
+  that does not contain rotation traffic. Verified with `diff` on
+  the clean synthetic log fixture: zero differences.
+- JSON output remains byte-identical to v1.9.1 on the same fixture.
+- No new dependencies, no schema changes, no CLI changes, no new
+  report sections.
+- `agg.high_traffic_redirect_first_seen` is not touched by the
+  override. The map is keyed by path alone (not bot) and populated
+  only for `canonical_loop` causes; rotation entries produce
+  `trailing_slash` causes per `_classify_redirect_cause()`, so the
+  map never contains rotation paths to begin with. Legitimate
+  canonical-loop entries on unrelated paths survive untouched.
+- Combined-format invocations work unchanged. The attribution
+  migration silently skips when there is no attribution data to
+  migrate.
+
+### Verification
+
+- 39-test suite (`test_v110.py`) green: 34 v1.10.1 tests + 5
+  redirect-migration tests covering basic combined-format
+  migration, seo_crawl-format attribution migration, legitimate
+  Googlebot redirects preserved alongside attacker rotation, the
+  Status-Code-Breakdown ↔ Redirect-Analysis consistency property,
+  and the `high_traffic_redirect_first_seen` untouched invariant.
+- Synthetic five-line seo_crawl reproduction of the 2026-05-16
+  axilog.io leak (three 301s on the no-slash trigger paths plus
+  two 404s, all from `5.255.104.83` under five named identities):
+  Redirect Analysis now reads `SuspectedBotIdentityRotation:
+  3 redirects` with the three trigger paths listed underneath.
+  No named-bot rows in Redirect Analysis. Status Code Breakdown
+  shows `SuspectedBotIdentityRotation: 301: 3, 404: 2`. The two
+  views agree.
+- Clean-log `diff` against v1.9.1: zero differences in text or JSON.
+
+### Versioning note
+
+This release is a patch (1.10.1 → 1.10.2) per the project's v1.x
+posture preservation rule. No new flags, no JSON schema changes,
+no new report sections, no behavioural changes for inputs that
+don't contain rotation 3xx traffic. The fix is strictly migrating
+two more counters that the v1.10.0 override should have migrated
+from the start.
+
+## v1.10.1 — 2026-05-16
+
+Two-fix patch closing the false-positive failure modes surfaced by
+the v1.10.0 production deployment on the 2026-05-16 axilog.io seo
+log. Trailing-slash variants of rotation trigger paths were slipping
+the trigger filter (`/api/env/` from `5.255.104.83` left a ClaudeBot
+404 in the real-crawler 404 list; `/api/config/` left a BaiduSpider
+404), and rotation 404s on non-probe trigger paths were inflating
+the deploy-window burst counter even after reattribution
+(producing a `[HIGH] Content-404 burst: 5 404s` finding on what was
+actually unified attacker traffic from a single rotating IP).
+
+### Fixed
+
+- **`__version__` bumped from `1.10.0` to `1.10.1`.**
+
+- **Trailing-slash variants of `ROTATION_TRIGGER_PATHS` now qualify
+  for the rotation override.** `is_rotation_trigger_path()` strips a
+  single trailing slash before the set lookup. `/api/env/` →
+  `/api/env` matches; `/api/config/` → `/api/config` matches; etc.
+  The root path `/` is preserved (the `len > 1` guard prevents
+  rstrip from collapsing it to `""`, which would have meant root
+  fetches falsely qualified). Query strings are stripped before
+  normalisation so cache-buster probes like `/api/env?x=1` and
+  `/api/env/?x=1` both qualify, matching the `clean_path` convention
+  used elsewhere in the analyser.
+
+  Motivated by the 2026-05-16 axilog.io production run: `5.255.104.83`
+  hit both `/api/env` (caught) and `/api/env/` (slipped through) in
+  the same rotation burst, leaving the trailing-slash 404s misclassified
+  as real-crawler failures.
+
+- **`apply_rotation_override()` decrements `minute_404s` and
+  `minute_content_404s` for any rotation entry that originally
+  contributed to them.** The gating conditions mirror the aggregate()
+  increment gate exactly:
+  ~~~
+  if status == 404 and not is_probe and not is_framework:
+      minute_404s[bucket] -= 1
+      if category not in {robots, sitemap, rss, llms, static asset}:
+          minute_content_404s[bucket] -= 1
+  ~~~
+  Probe-matched rotation entries never entered the burst counter in
+  the first place (the aggregate gate skipped them), so the override
+  correctly skips them on the way out. Verified with a mixed-fixture
+  test: probe-path rotation does not double-decrement; non-probe
+  rotation is stripped cleanly.
+
+  Motivated by the same 2026-05-16 axilog.io run: five rotation
+  404s from `5.255.104.83` within one minute fired the burst
+  detector even after reattribution to
+  `SuspectedBotIdentityRotation`, because the burst counter was
+  populated during aggregation and never updated by the override.
+
+### Preserved
+
+- All v1.10.0 behaviour preserved except the two specific
+  false-positive paths above. CLI flags, JSON schema, report
+  section layout, classification semantics — all unchanged.
+- Default text output remains byte-identical to v1.9.1 for any log
+  that does not contain rotation traffic. Verified with `diff` on
+  the clean synthetic log fixture: zero differences.
+- JSON output remains byte-identical to v1.9.1 on the same fixture.
+- No new dependencies, no schema changes, no CLI changes.
+- Rotation summary fields store the path verbatim — operators see
+  the exact form the attacker requested (`/api/env/` if that's
+  what nginx logged), not a normalised canonical form. Normalisation
+  is applied only inside `is_rotation_trigger_path()` for the
+  set-membership check.
+- Real content-404 bursts remain visible. The override decrements
+  only rotation-attributable entries; legitimate Googlebot 404s in
+  the same minute (e.g. a real deploy-window symptom from a
+  different IP) continue to drive a `[HIGH] Content-404 burst`
+  finding. Verified with a mixed-traffic test: rotation entries
+  removed, legitimate burst still flagged.
+
+### Verification
+
+- 34-test suite (`test_v110.py`) green: 23 v1.10.0 tests + 7
+  trailing-slash normalisation tests (helper-direct + end-to-end)
+  + 4 burst-counter decrement tests (decrement gating, no
+  double-decrement on probe paths, partial burst with legitimate
+  traffic surviving).
+- Synthetic five-line reproduction of the 2026-05-16 axilog.io
+  failure mode (`/api/env/`, `/api/config/`, `/actuator/env/`,
+  `/secrets.json`, `/appsettings.json` from `5.255.104.83` under
+  five identities): "No crawler 404s recorded. ✓", "No
+  deploy-window symptoms detected. ✓", and rotation section
+  surfaces all 5 entries with all 5 identities. The two
+  pre-v1.10.1 false positives are gone.
+- Clean-log `diff` against v1.9.1: zero differences in text or JSON.
+
+### Versioning note
+
+This release is a patch (1.10.0 → 1.10.1) per the project's v1.x
+posture preservation rule. No new flags, no JSON schema changes,
+no new report sections, no behavioural changes for inputs that
+don't trigger the two failure modes. The fix is strictly removing
+attacker rotation traffic from two counters it should never have
+inflated.
+
+## v1.10.0 — 2026-05-16
+
+Rotational bot-identity detection. The 2026-05-16 nginx-probe jail
+deployment surfaced a single attacker IP (`5.255.104.83`) issuing
+requests under five distinct named-bot user agents within a 60-second
+window — Googlebot, GPTBot, Baiduspider, ClaudeBot, YandexBot — while
+probing `/.env` variants, `/.git/config`, `/config.json`, `/api/env`,
+and `/actuator/env` across speytech.com and axilog.io. No published
+crawler operates under multiple identities from a single egress; this
+is unambiguously an attacker probing the "do you trust this UA?"
+surface. v1.9's `SuspectedUASpoof` classifier catches *behavioural*
+spoofing (browser-UA on sitemap paths, no referrer) but not
+*rotational* spoofing (one IP, multiple distinct named-bot UAs in
+short succession across probe paths). v1.10 closes that gap and
+restores accurate health scores on logs containing the pattern.
+
+### Added
+
+- **`SuspectedBotIdentityRotation` classification** applied as a
+  second-stage post-aggregation override, mirroring v1.7's
+  `SuspectedUASpoof` pattern. A request is reclassified when the
+  first-stage classifier returned a named bot in
+  `ROTATION_OVERRIDE_CANDIDATES`, the source IP was observed under
+  ≥3 distinct named-bot UAs within a 5-minute window, and the path
+  is in `ROTATION_TRIGGER_PATHS` or matches the existing
+  `SECURITY_PROBE_PATTERNS` regex set.
+- **`ROTATION_OVERRIDE_CANDIDATES`** — 24-entry frozenset of real
+  named crawlers an attacker would plausibly claim to be (Googlebot,
+  Bingbot, all four Claude variants, GPTBot, YandexBot, BaiduSpider,
+  PerplexityBot, FacebookExternalHit, etc.). `GenericBot`,
+  `UnknownBot`, `Empty-UA`, `Human/Other`, and `SuspectedUASpoof`
+  are deliberately excluded — rotational identity claims are
+  interesting only when the attacker is specifically pretending to
+  be a *known trusted* crawler.
+- **`ROTATION_TRIGGER_PATHS`** — 19-entry frozenset covering the
+  post-v1.9 attack surface: `/config.json`, `/secrets.json`,
+  `/appsettings.json`, `/credentials.json`, `/actuator{,/env,/heapdump}`,
+  `/api/{env,config,secrets,credentials,admin,debug,users,auth,tokens,keys}`,
+  `/vendor/composer/installed.json`. Path-matched exactly; broader
+  probe-shaped paths are caught by the existing `is_security_probe()`
+  helper.
+- **Rotational Bot-Identity Detection** report section, positioned
+  between Suspected UA-Spoof Detection and Framework Fingerprint
+  Probes (the two attacker-noise classes adjacent in the report).
+  Renders top rotating IPs with their claimed identity sets, top
+  identity combinations across IPs (useful for spotting shared
+  toolkit signatures), and top probed paths. Suppressed entirely
+  when no rotation is detected.
+- **`--rotation-window-minutes N`** (default: 5). Window over which
+  multiple identities from one IP trigger the override. The
+  2026-05-16 production rotation completed in ~60 seconds; the
+  default leaves headroom for slower campaigns.
+- **`--rotation-min-identities N`** (default: 3, floor: 2). Below 3,
+  the signal is too weak — two identities could plausibly be a shared
+  egress for two real crawlers. The floor is enforced in `main()`;
+  values below 2 fall back to the default with a stderr warning.
+- **`--show-rotation-detail`** — full per-request listing analogous
+  to `--show-spoof-detail`.
+- **`rotational_bot_identity` JSON key** (additive, conditional —
+  omitted entirely when no rotation is detected). Carries `total`,
+  `unique_ips`, `rotation_window_minutes`, `min_identities_threshold`,
+  `top_ips` (each with `ip`, `requests`, sorted `identities`, and up
+  to 10 sorted `paths`), `top_identity_combinations`, and `top_paths`.
+- **`detect_rotation_indices()` helper.** Pure function over a per-IP
+  identity log; window-walking algorithm from the brief §4.3. O(N²)
+  worst case per IP, bounded by `ROTATION_LOG_CAP_PER_IP = 100`.
+- **`apply_rotation_override()` helper.** Post-aggregation pass that
+  re-attributes counters from named bots to
+  `SuspectedBotIdentityRotation` across `bot_status`, `bot_urls`,
+  `bot_url_status`, `bot_ips`, `special_files`, `crawler_404s`,
+  `crawler_404_samples`, and the Googlebot-specific caches.
+- **23-test unit suite** (`test_v110.py`) covering the eight §4.4
+  boundary cases for the window walker, classification override
+  behaviour across eligible/ineligible bots and trigger/non-trigger
+  paths, the `ignore_source_ips` exemption, report rendering with
+  and without rotation, JSON shape, an end-to-end test against a
+  14-line synthetic log reproducing the exact 2026-05-16
+  `5.255.104.83` pattern, and CLI flag wiring.
+
+### Changed
+
+- **Crawler-Visible 404s** drops rotation-attributable entries.
+  Named-bot 404s from a rotating attacker IP are removed from the
+  per-path per-bot 404 list, leaving only genuine real-crawler
+  failures.
+- **Googlebot Crawl Health Score** improves on logs containing
+  rotation traffic. Rotation entries vanish from the Googlebot
+  bucket before the score is computed, so 404-rate and redirect-rate
+  deductions no longer fire on attacker attribution.
+- **Search Crawler Health Score** likewise improves. On the
+  2026-05-16 axilog.io seo log this is the score that flips from
+  90/100 (with `-10: real-crawler 404 rate 2.6%`) back to 100/100 —
+  the deduction was entirely driven by rotation entries.
+- **AI Crawler Report** excludes rotation entries from the AI
+  crawler cohort. An attacker claiming to be GPTBot or ClaudeBot
+  no longer inflates AI crawler attention numbers.
+- **Status Code Breakdown By Bot** retains the rotation
+  classification as its own row, so operators see exactly how much
+  traffic was reclassified alongside the legitimate per-bot totals.
+- **Aggregate dataclass** gains `ip_identity_log`, `rotation_count`,
+  `rotation_ip_requests`, `rotation_ip_identities`,
+  `rotation_ip_paths`, `rotation_identity_combinations`,
+  `rotation_path_counts`, `rotation_entries`,
+  `rotation_window_minutes`, and `rotation_min_identities`.
+- **`filter_for_bot()`** preserves rotation state through `--bot`
+  narrowing. The rotation section is a behavioural signal independent
+  of which named bot the operator is investigating, so it surfaces
+  regardless of filter.
+
+### Preserved
+
+- All v1.9.x CLI invocations work unchanged. The three new flags
+  are additive with safe defaults.
+- Default text output is byte-identical to v1.9.1 for any log that
+  does not contain rotation traffic. Verified with `diff` on a
+  synthetic clean log: zero differences.
+- JSON output is byte-identical to v1.9.1 for any log that does not
+  contain rotation traffic. The new top-level key is conditional —
+  omitted entirely (not `null`, not `{}`) when there's no rotation.
+- No new dependencies. Single-file Python stdlib script preserved.
+- Behaviour of `SuspectedUASpoof`, framework-probe opacity,
+  AI crawler expectation, site context, and every other v1.9
+  surface is unchanged.
+
+### Notes
+
+- **`ignore_source_ips` interaction.** Source IPs in the resolved
+  ignore set are exempt from rotation candidate capture, matching
+  v1.5's probe-noise filtering. An operator's own scripted multi-UA
+  curl tests from a host VM will not be flagged.
+  `--no-config-ignores` opts those IPs back into rotation detection
+  for the same investigation reason it opts them back into the
+  probe summary.
+- **`SuspectedUASpoof` overlap.** `SuspectedUASpoof` is deliberately
+  NOT in `ROTATION_OVERRIDE_CANDIDATES`. A spoof-classified request
+  never enters the rotation candidate pool; the two classifications
+  cannot compete on the same entry.
+- **False positives.** Rotational identity claims are unambiguous in
+  a way the v1.7 spoof heuristic is not — there is no legitimate
+  operational reason for one IP to claim three different named-bot
+  identities while probing security-sensitive paths. The
+  min-identities floor of 3 protects against the only theoretical
+  edge case (shared datacentre egress for two real crawlers). If a
+  false positive does emerge, `--rotation-window-minutes` tightens
+  the window without rebuild.
+
+### Verification
+
+- 23-test suite (`test_v110.py`) green: 8 window-walker boundary
+  cases (§4.4), 7 classification-override tests, 2 report-rendering
+  tests, 3 JSON-shape tests, 1 end-to-end test through `main()` on
+  the 14-line synthetic 2026-05-16 fixture, 2 CLI-flag tests.
+- Backward-compatibility check: `diff` of v1.9.1 vs v1.10.0 text
+  output on a clean synthetic log produces zero output; same for
+  `--format json`. Both formats are byte-identical when no rotation
+  is present.
+- Synthetic 2026-05-16 reproduction (`5.255.104.83` claiming six
+  identities across 11 probe requests, plus three legitimate
+  Googlebot fetches from `66.249.66.10`): rotation section renders
+  correctly with all six identities listed; `bot_breakdown.Googlebot`
+  shows the three legitimate 2xx hits unchanged; both health scores
+  remain at 100/100.
+- Production verification recipe in `docs/VERIFICATION-v1.10.0.md`
+  with the five expected outcomes for the 2026-05-16 axilog.io
+  seo log re-run.
+
+### Versioning note
+
+This release is a minor (1.9.1 → 1.10.0) per the project's v1.x
+posture: new CLI flags, new classification, new report section, new
+conditional JSON key — all additive. No removed features. No CLI
+behaviour changes for existing flags. Zero risk to v1.9.x cron
+invocations.
+
 ## v1.9.1 — 2026-05-16
 
 Single-line bugfix for a false-positive in the framework fingerprint
