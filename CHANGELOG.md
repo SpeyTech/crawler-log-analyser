@@ -7,7 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.9.0] — 2026-05-15
+## v1.9.1 — 2026-05-16
+
+Single-line bugfix for a false-positive in the framework fingerprint
+probe detector.
+
+### Fixed
+
+- `__version__` bumped from `1.9.0` to `1.9.1`.
+
+- `/.well-known/pgp-key.txt` is now exempt from the framework fingerprint
+  probe pattern, alongside the existing `/.well-known/security.txt`
+  exemption. Both files are legitimate site assets — the former being
+  the published PGP key referenced by the latter under RFC 9116. Previously
+  every crawler fetch of `/pgp-key.txt` produced a "Build artefact(s)
+  exposed" warning in the daily report, which was a false positive.
+
+  The negative lookahead in `FRAMEWORK_PROBE_PATTERNS` changes from:
+  ~~~
+  re.compile(r"^/\.well-known/(?!security\.txt$)", re.IGNORECASE)
+  ~~~
+  to:
+  ~~~
+  re.compile(r"^/\.well-known/(?!security\.txt$|pgp-key\.txt$)", re.IGNORECASE)
+  ~~~
+
+  Motivated by today's deployment of `/.well-known/pgp-key.txt` on
+  speytech.com and axilog.io as part of RFC 9116 disclosure infrastructure.
+  Verified post-fix: the speytech.com daily report flipped from a
+  "Build artefact(s) exposed" warning to "Site is opaque to framework
+  fingerprinting" — the latter being correct.
+
+### Preserved
+
+- All v1.9.0 behaviour preserved exactly. The negative lookahead change
+  only affects the framework probe classifier; everything else
+  (config parsing, AI crawler expectation, opacity scoring, JSON
+  schema, CLI flags) is unchanged.
+- No new dependencies, no schema changes, no CLI changes.
+- Output for inputs that don't contain `/.well-known/pgp-key.txt` requests
+  is byte-identical to v1.9.0.
+
+### Verification
+
+- Manual regression test on 12 path edge cases covered legitimate files
+  (must NOT match), backup-probe attempts (MUST match), case sensitivity,
+  future RFC 9974 (`change-password`) paths, and typo-variant paths.
+  All 12 cases passed.
+- Production verification: re-ran daily report against
+  `/var/log/nginx/speytech.com.seo.log` after deploy. The "Build
+  artefact(s) exposed" warning is gone; the report now correctly
+  classifies the site as opaque to framework fingerprinting.
+
+### Versioning note
+
+This release is a patch (1.9.0 → 1.9.1) per the project's v1.x posture
+preservation rule. No new flags, no JSON schema changes, no new
+report sections.
+
+## 1.9.0 — 2026-05-15
 
 Three "explained absence" features. v1.8 reports correctly flagged the
 absence of AI crawler activity, framework-probe responses, and per-site

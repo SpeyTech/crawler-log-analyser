@@ -34,7 +34,7 @@ Author: William Murray, SpeyTech
 
 from __future__ import annotations
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 import argparse
 import gzip
@@ -426,7 +426,7 @@ FRAMEWORK_PROBE_PATTERNS = [
     re.compile(r"^/stats\.json$", re.IGNORECASE),
     re.compile(r"^/dist/", re.IGNORECASE),
     re.compile(r"^/build/", re.IGNORECASE),
-    re.compile(r"^/\.well-known/(?!security\.txt$)", re.IGNORECASE),
+    re.compile(r"^/\.well-known/(?!security\.txt$|pgp-key\.txt$)", re.IGNORECASE),
 ]
 
 
