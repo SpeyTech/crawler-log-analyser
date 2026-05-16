@@ -11,21 +11,30 @@ Supports both the standard nginx combined log format and the extended
 seo_crawl format (with $host, $scheme, $request_time, $upstream_response_time).
 Format is auto-detected per file; use --log-format to override.
 
+v1.9 adds three "explained absence" features:
+  - Site metadata via [sites."<host>"] config table (launch dates)
+  - AI crawler discovery-window context (too_early / in_window /
+    overdue / active classifications, replacing the bare "no AI
+    crawler activity" line on young sites)
+  - Framework probe opacity signal (positive framing when all probes
+    404, exposure warning when any 2xx)
+
 Usage:
     python3 crawler_log_analyser.py /var/log/nginx/access.log
     python3 crawler_log_analyser.py /var/log/nginx/access.log* --format markdown --output report.md
     python3 crawler_log_analyser.py /var/log/nginx/access.log --bot googlebot --verify-googlebot
     python3 crawler_log_analyser.py /var/log/nginx/speytech.com.seo.log
 
-No external dependencies required.
+Requires: Python 3.11+ (uses stdlib tomllib for config-file parsing).
+No external dependencies.
 
-Version: 1.8.0
+Version: 1.9.0
 Author: William Murray, SpeyTech
 """
 
 from __future__ import annotations
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 import argparse
 import gzip
@@ -230,7 +239,27 @@ CONFIG_HOME_DOT_NAME = ".crawler-log-analyser.toml"
 # breaking v1.8 invocations against newer config files.
 CONFIG_KNOWN_KEYS: frozenset[str] = frozenset({
     "ignore_source_ips",
+    # v1.9 tables. Each maps to a sub-dict in the parsed TOML and is
+    # consumed by load_config() into the relevant ResolvedConfig fields.
+    "sites",
+    "ai_crawlers",
 })
+
+# v1.9 default discovery window for AI crawlers. The 7-day floor matches
+# the fastest observed AI crawler arrival on a sitemap+llms.txt-enabled
+# property (ClaudeBot, PerplexityBot). The 21-day ceiling covers more
+# conservative crawlers (Applebot, AI variants of DuckDuckBot). Past 21
+# days with zero AI activity is the threshold at which absence becomes
+# a signal worth flagging. Operators can override via the
+# [ai_crawlers] table in config.toml — see load_config().
+AI_DISCOVERY_WINDOW_MIN_DAYS_DEFAULT = 7
+AI_DISCOVERY_WINDOW_MAX_DAYS_DEFAULT = 21
+
+# Validation range for the configurable window. Anything outside this
+# range is rejected as a config error rather than a plausible
+# calibration choice — a 0-day floor or a 5-year ceiling almost
+# certainly indicates a typo.
+AI_DISCOVERY_WINDOW_VALID_RANGE = (1, 365)
 
 # URL category classifiers, evaluated top to bottom.
 URL_CATEGORIES: list[tuple[str, re.Pattern[str]]] = [
@@ -497,6 +526,16 @@ class ResolvedConfig:
         no config file was present (run is using CLI args only).
     ignore_source_ips_from_config: IPs supplied by the config file.
     ignore_source_ips_from_cli: IPs supplied by --ignore-source-ip.
+    sites: v1.9. Hostname → metadata dict from the [sites] table. The
+        metadata dict currently only carries `launch_date`, but the
+        shape is open so future per-site keys (latency thresholds,
+        expected traffic floors) drop in without a schema rewrite.
+    ai_discovery_window_min_days: v1.9. Lower bound (inclusive) of the
+        AI crawler discovery window in days. Below this, absence of
+        AI crawler activity is classified "too_early".
+    ai_discovery_window_max_days: v1.9. Upper bound (inclusive) of the
+        AI crawler discovery window in days. Above this, absence is
+        "overdue" and worth a warning.
     unknown_keys: any keys in the config file that the analyser didn't
         recognise. Surfaced as stderr warnings but never fatal.
     parse_warnings: any non-fatal parse problems (e.g. file unreadable,
@@ -506,6 +545,9 @@ class ResolvedConfig:
     source_path: Path | None = None
     ignore_source_ips_from_config: list[str] = field(default_factory=list)
     ignore_source_ips_from_cli: list[str] = field(default_factory=list)
+    sites: dict[str, dict[str, str]] = field(default_factory=dict)
+    ai_discovery_window_min_days: int = AI_DISCOVERY_WINDOW_MIN_DAYS_DEFAULT
+    ai_discovery_window_max_days: int = AI_DISCOVERY_WINDOW_MAX_DAYS_DEFAULT
     unknown_keys: list[str] = field(default_factory=list)
     parse_warnings: list[str] = field(default_factory=list)
 
@@ -552,105 +594,6 @@ def discover_config_path(explicit: str | None = None) -> Path | None:
     return None
 
 
-def _parse_toml_subset(content: str) -> tuple[dict[str, object], list[str]]:
-    """Minimal TOML parser covering the v1.8 config subset.
-
-    Supported syntax:
-        # comment line
-        key = "string value"
-        key = ["item one", "item two", "item three"]
-        (blank lines)
-
-    NOT supported (will produce a parse warning):
-        [section] tables
-        inline tables { x = 1 }
-        nested arrays
-        numeric values, booleans, dates
-
-    The v1.8 config schema only needs string values and string-array
-    values; the broader TOML surface is deliberately out of scope so
-    this fallback parser stays small and predictable. Python 3.11+
-    users get tomllib via the load_config() shim, which handles the
-    full TOML spec correctly.
-
-    Returns (parsed_dict, warnings).
-    """
-    parsed: dict[str, object] = {}
-    warnings: list[str] = []
-
-    for lineno, raw in enumerate(content.splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        # Strip trailing comments (best-effort; doesn't handle # inside
-        # strings, which is a TOML edge case we don't need for v1.8).
-        if "#" in line and '"' not in line.split("#", 1)[0]:
-            line = line.split("#", 1)[0].strip()
-
-        if line.startswith("["):
-            warnings.append(
-                f"line {lineno}: [section] tables not supported by the "
-                "fallback TOML parser (use Python 3.11+ for full TOML)"
-            )
-            continue
-
-        if "=" not in line:
-            warnings.append(f"line {lineno}: expected 'key = value', got: {raw!r}")
-            continue
-
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-
-        # String value
-        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
-            parsed[key] = value[1:-1]
-            continue
-
-        # Array value (single-line only)
-        if value.startswith("[") and value.endswith("]"):
-            inner = value[1:-1].strip()
-            if not inner:
-                parsed[key] = []
-                continue
-            items: list[str] = []
-            ok = True
-            # Split on commas not inside quotes. Simple state machine.
-            buf = ""
-            in_string = False
-            for ch in inner:
-                if ch == '"':
-                    in_string = not in_string
-                    buf += ch
-                elif ch == "," and not in_string:
-                    items.append(buf.strip())
-                    buf = ""
-                else:
-                    buf += ch
-            if buf.strip():
-                items.append(buf.strip())
-            cleaned: list[str] = []
-            for item in items:
-                if item.startswith('"') and item.endswith('"') and len(item) >= 2:
-                    cleaned.append(item[1:-1])
-                else:
-                    warnings.append(
-                        f"line {lineno}: array item is not a quoted string: {item!r}"
-                    )
-                    ok = False
-                    break
-            if ok:
-                parsed[key] = cleaned
-            continue
-
-        warnings.append(
-            f"line {lineno}: unsupported value shape for key {key!r}: {value!r}"
-        )
-
-    return parsed, warnings
-
-
 def load_config(path: Path | None) -> ResolvedConfig:
     """Read and validate the config file. Always returns a ResolvedConfig.
 
@@ -680,24 +623,19 @@ def load_config(path: Path | None) -> ResolvedConfig:
         )
         return config
 
-    # Prefer stdlib tomllib (Python 3.11+) when available; fall back to
-    # the minimal subset parser otherwise. tomllib handles full TOML
-    # spec including [section] tables, integers, booleans, etc; the
-    # fallback is deliberately small.
-    parsed: dict[str, object]
+    # v1.9 requires Python 3.11+, so tomllib is unconditionally
+    # available. The pre-v1.9 fallback parser (which supported only
+    # `key = string` and `key = ["list"]` at the top level) has been
+    # removed; any operator on 3.10 or older will hit the runtime
+    # check in main() before reaching this function.
+    import tomllib
     try:
-        import tomllib  # type: ignore[import-not-found]
-        try:
-            parsed = tomllib.loads(content)
-        except tomllib.TOMLDecodeError as exc:
-            config.parse_warnings.append(
-                f"config file {path} has invalid TOML: {exc}; continuing without config"
-            )
-            return config
-    except ImportError:
-        parsed, fallback_warnings = _parse_toml_subset(content)
-        for w in fallback_warnings:
-            config.parse_warnings.append(f"{path}: {w}")
+        parsed = tomllib.loads(content)
+    except tomllib.TOMLDecodeError as exc:
+        config.parse_warnings.append(
+            f"config file {path} has invalid TOML: {exc}; continuing without config"
+        )
+        return config
 
     # Validate the parsed data against the known schema.
     for key, value in parsed.items():
@@ -719,8 +657,152 @@ def load_config(path: Path | None) -> ResolvedConfig:
                     )
                     continue
                 config.ignore_source_ips_from_config.append(ip)
+        elif key == "sites":
+            # v1.9 [sites] table. Shape: {host: {metadata_key: value}}.
+            # Each metadata dict currently carries only launch_date; the
+            # validator rejects entries with no metadata or non-string
+            # values but accepts unknown keys to leave room for future
+            # per-site fields (latency thresholds, etc) without a
+            # schema rewrite.
+            if not isinstance(value, dict):
+                config.parse_warnings.append(
+                    f"config key 'sites' must be a table of host blocks, "
+                    f"got {type(value).__name__}; ignoring this key"
+                )
+                continue
+            for host, meta in value.items():
+                if not isinstance(meta, dict):
+                    config.parse_warnings.append(
+                        f"config: [sites.\"{host}\"] must be a table, "
+                        f"got {type(meta).__name__}; ignoring this host"
+                    )
+                    continue
+                host_meta: dict[str, str] = {}
+                for mkey, mval in meta.items():
+                    if mkey == "launch_date":
+                        # Accept either a string in ISO-8601 (YYYY-MM-DD)
+                        # form, or a datetime.date that tomllib produces
+                        # when a TOML local-date literal is used. Normalise
+                        # both to the string form for downstream consumers.
+                        if isinstance(mval, str):
+                            if not _is_iso_date(mval):
+                                config.parse_warnings.append(
+                                    f"config: [sites.\"{host}\"] "
+                                    f"launch_date {mval!r} is not in "
+                                    f"YYYY-MM-DD form; ignoring this host"
+                                )
+                                continue
+                            host_meta["launch_date"] = mval
+                        elif hasattr(mval, "isoformat"):
+                            # datetime.date — convert.
+                            host_meta["launch_date"] = mval.isoformat()
+                        else:
+                            config.parse_warnings.append(
+                                f"config: [sites.\"{host}\"] "
+                                f"launch_date must be a string in "
+                                f"YYYY-MM-DD form, got "
+                                f"{type(mval).__name__}; ignoring this host"
+                            )
+                            continue
+                    else:
+                        # Unknown per-site key — preserve for future use
+                        # (e.g. v1.10 per-site latency thresholds) but
+                        # surface as a parse warning so a typo is
+                        # caught immediately.
+                        config.parse_warnings.append(
+                            f"config: [sites.\"{host}\"] has unknown "
+                            f"key {mkey!r} (may be supported by a "
+                            f"future version)"
+                        )
+                        if isinstance(mval, str):
+                            host_meta[mkey] = mval
+                if host_meta:
+                    config.sites[host] = host_meta
+        elif key == "ai_crawlers":
+            # v1.9 [ai_crawlers] table. Carries the configurable
+            # discovery window. Both bounds are validated against
+            # AI_DISCOVERY_WINDOW_VALID_RANGE; min must be <= max.
+            if not isinstance(value, dict):
+                config.parse_warnings.append(
+                    f"config key 'ai_crawlers' must be a table, "
+                    f"got {type(value).__name__}; ignoring this key"
+                )
+                continue
+            window_min = value.get("expected_discovery_window_days_min")
+            window_max = value.get("expected_discovery_window_days_max")
+            # Validate types and ranges separately so the operator sees
+            # both problems if both are present.
+            min_lo, max_hi = AI_DISCOVERY_WINDOW_VALID_RANGE
+            if window_min is not None:
+                if not isinstance(window_min, int) or isinstance(window_min, bool):
+                    config.parse_warnings.append(
+                        f"config: [ai_crawlers] "
+                        f"expected_discovery_window_days_min must be an "
+                        f"integer, got {type(window_min).__name__}; "
+                        f"keeping default ({config.ai_discovery_window_min_days})"
+                    )
+                elif not (min_lo <= window_min <= max_hi):
+                    config.parse_warnings.append(
+                        f"config: [ai_crawlers] "
+                        f"expected_discovery_window_days_min={window_min} "
+                        f"is outside the valid range [{min_lo}, {max_hi}]; "
+                        f"keeping default ({config.ai_discovery_window_min_days})"
+                    )
+                else:
+                    config.ai_discovery_window_min_days = window_min
+            if window_max is not None:
+                if not isinstance(window_max, int) or isinstance(window_max, bool):
+                    config.parse_warnings.append(
+                        f"config: [ai_crawlers] "
+                        f"expected_discovery_window_days_max must be an "
+                        f"integer, got {type(window_max).__name__}; "
+                        f"keeping default ({config.ai_discovery_window_max_days})"
+                    )
+                elif not (min_lo <= window_max <= max_hi):
+                    config.parse_warnings.append(
+                        f"config: [ai_crawlers] "
+                        f"expected_discovery_window_days_max={window_max} "
+                        f"is outside the valid range [{min_lo}, {max_hi}]; "
+                        f"keeping default ({config.ai_discovery_window_max_days})"
+                    )
+                else:
+                    config.ai_discovery_window_max_days = window_max
+            # Final coherence check: min must be <= max. If the operator
+            # set them inverted (or one is the default and the other
+            # crosses it), warn and reset both to defaults.
+            if config.ai_discovery_window_min_days > config.ai_discovery_window_max_days:
+                config.parse_warnings.append(
+                    f"config: [ai_crawlers] window_min "
+                    f"({config.ai_discovery_window_min_days}) > "
+                    f"window_max ({config.ai_discovery_window_max_days}); "
+                    f"reverting both to defaults"
+                )
+                config.ai_discovery_window_min_days = AI_DISCOVERY_WINDOW_MIN_DAYS_DEFAULT
+                config.ai_discovery_window_max_days = AI_DISCOVERY_WINDOW_MAX_DAYS_DEFAULT
+            # Warn on unknown subkeys so a typo of e.g.
+            # expected_discovery_window_days_mim doesn't silently
+            # leave the default in place.
+            for subkey in value.keys():
+                if subkey not in {
+                    "expected_discovery_window_days_min",
+                    "expected_discovery_window_days_max",
+                }:
+                    config.parse_warnings.append(
+                        f"config: [ai_crawlers] has unknown key "
+                        f"{subkey!r} (may be supported by a future "
+                        f"version)"
+                    )
 
     return config
+
+
+def _is_iso_date(s: str) -> bool:
+    """True if s is a YYYY-MM-DD date string that strptime accepts."""
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def render_config_summary(config: ResolvedConfig) -> str:
@@ -753,6 +835,32 @@ def render_config_summary(config: ResolvedConfig) -> str:
     lines.append(f"Effective ignore-source-ip set ({len(effective)} IPs):")
     for ip in effective:
         lines.append(f"  {ip}")
+
+    # v1.9: sites table. Sorted by hostname so the same config produces
+    # the same output on every run.
+    lines.append("")
+    lines.append(f"Sites configured: {len(config.sites)}")
+    for host in sorted(config.sites.keys()):
+        meta = config.sites[host]
+        launch = meta.get("launch_date", "(no launch date set)")
+        lines.append(f"  {host}: launch_date={launch}")
+        # Surface any unknown per-site keys (preserved by load_config
+        # with a warning) so the operator sees them in --show-config.
+        for k, v in sorted(meta.items()):
+            if k != "launch_date":
+                lines.append(f"    {k}={v}  (unknown key, preserved)")
+
+    # v1.9: AI crawler discovery window.
+    lines.append("")
+    lines.append("AI crawler discovery window:")
+    lines.append(
+        f"  expected_discovery_window_days_min: "
+        f"{config.ai_discovery_window_min_days}"
+    )
+    lines.append(
+        f"  expected_discovery_window_days_max: "
+        f"{config.ai_discovery_window_max_days}"
+    )
 
     if config.unknown_keys:
         lines.append("")
@@ -1127,6 +1235,14 @@ class Aggregate:
     # Framework fingerprint probe summary (Next/Nuxt/webpack/etc).
     framework_probe_count: int = 0
     framework_probe_paths: Counter[str] = field(default_factory=Counter)
+    # v1.9: per-path status counter so the renderer can compute the
+    # opacity signal (all probes 4xx = site is opaque to fingerprinting;
+    # any 2xx = build artefact exposed). Kept alongside
+    # framework_probe_paths rather than replacing it so any external
+    # consumer reading the v1.8 field continues to work.
+    framework_probe_status: dict[str, Counter[int]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
 
     # Bad-request (400) noise: malformed exploit/probe traffic that lands
     # before any URL routing happens, so it skews UnknownBot totals.
@@ -1232,6 +1348,16 @@ class Aggregate:
         default_factory=dict
     )
 
+    # v1.9: hostname captured from the first log entry's $host field.
+    # Only populated when the input is seo_crawl-format (combined-format
+    # has no host field). When set, it keys the per-site config lookup
+    # for launch-date and other site metadata. One log = one host by
+    # convention, so the first entry is authoritative; if a later entry
+    # has a different host the analyser does not switch — that would
+    # indicate the operator concatenated logs from different sites and
+    # the site-context output would be misleading either way.
+    host: str | None = None
+
 
 def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
               show_security_probes: bool,
@@ -1259,6 +1385,13 @@ def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
         if agg.latest is None or e.ts > agg.latest:
             agg.latest = e.ts
 
+        # v1.9: capture the host from the first entry that carries one.
+        # Only seo_crawl-format entries have e.host set; combined-format
+        # leaves it None and the host-dependent report sections are
+        # skipped entirely.
+        if agg.host is None and e.host:
+            agg.host = e.host
+
         # Always track probe summary, regardless of suppression flag.
         # v1.5: skip probe tracking for ignored source IPs (e.g. operator
         # self-tests from the host VM). The entry still flows through to
@@ -1271,6 +1404,8 @@ def aggregate(entries: Iterable[LogEntry], include_non_bots: bool,
         if e.is_framework:
             agg.framework_probe_count += 1
             agg.framework_probe_paths[e.path] += 1
+            # v1.9: track status per path for opacity computation.
+            agg.framework_probe_status[e.path][e.status] += 1
 
         # Bad-request (400) traffic: malformed bytes hitting nginx before
         # routing. Tracked separately so it doesn't skew "real" totals.
@@ -1437,6 +1572,39 @@ def compute_percentiles(samples: list[float]) -> dict[str, float] | None:
         "p95": qs[94],
         "p99": qs[98],
     }
+
+
+def compute_site_age(launch_date: str, reference: datetime) -> int:
+    """v1.9: return the number of whole days between launch_date and reference.
+
+    launch_date is an ISO-8601 date string (validated by load_config to
+    parse via strptime). reference is the timestamp of the latest log
+    entry in the analysis period — using agg.latest rather than
+    "now" keeps the calculation stable when reports are run against
+    historical logs.
+
+    Returns a non-negative integer. A reference earlier than the launch
+    date returns 0 rather than a negative value — that case is a
+    config error (operator set a launch date in the future) and the
+    age-derived classification should treat the site as "just
+    launched" rather than emit a negative age.
+
+    Days are computed against UTC dates. A site launched on
+    2026-05-14 UTC has age 0 on 2026-05-14T00:00:00Z, age 1 on
+    2026-05-15T00:00:00Z, etc.
+    """
+    try:
+        launch = datetime.strptime(launch_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, TypeError):
+        # Defensive: load_config validates the format, but a future
+        # caller might pass an unvalidated string. Returning 0 is
+        # safer than raising.
+        return 0
+    ref_utc = reference.astimezone(timezone.utc)
+    delta = ref_utc.date() - launch.date()
+    return max(0, delta.days)
 
 
 def in_post_indexnow_window(
@@ -2052,7 +2220,152 @@ def render_health_score(agg: Aggregate, fmt: str,
     return "\n".join(out) + "\n"
 
 
-def render_ai_crawlers(agg: Aggregate, fmt: str, bot_filter: str) -> str:
+def classify_ai_crawler_expectation(
+    agg: Aggregate,
+    config: ResolvedConfig,
+) -> tuple[str, int | None, str | None]:
+    """v1.9: classify AI-crawler absence (or presence) given site age.
+
+    Returns (classification, age_days, launch_date) where:
+      - classification is one of:
+          "active"     — at least one AI crawler has activity in the period
+          "too_early"  — no activity AND site age < window_min
+          "in_window"  — no activity AND window_min <= age <= window_max
+          "overdue"    — no activity AND age > window_max
+          "unknown"    — cannot classify (no host captured, no launch
+                         date configured, or no parse data). In this
+                         case age_days and launch_date may be None.
+      - age_days is the resolved site age in days, or None when no
+        launch date is available
+      - launch_date is the ISO date string from config, or None
+
+    The "active" branch returns age data if available, but the v1.8
+    renderer for the active branch doesn't need it — only the absence
+    branches benefit from the context.
+    """
+    # Did any AI crawler show activity?
+    activity = any(
+        agg.bot_status.get(bot) and sum(agg.bot_status[bot].values()) > 0
+        for bot in AI_CRAWLERS
+    )
+
+    # Resolve site age if we can. Requires both a captured host and a
+    # configured launch date.
+    launch_date: str | None = None
+    age_days: int | None = None
+    if agg.host is not None:
+        site_meta = config.sites.get(agg.host)
+        if site_meta is not None:
+            launch_date = site_meta.get("launch_date")
+            if launch_date is not None and agg.latest is not None:
+                age_days = compute_site_age(launch_date, agg.latest)
+
+    if activity:
+        return ("active", age_days, launch_date)
+
+    # No activity. Classify by age. Without an age we can't say
+    # anything more useful than v1.8 did.
+    if age_days is None:
+        return ("unknown", None, None)
+
+    if age_days < config.ai_discovery_window_min_days:
+        return ("too_early", age_days, launch_date)
+    if age_days <= config.ai_discovery_window_max_days:
+        return ("in_window", age_days, launch_date)
+    return ("overdue", age_days, launch_date)
+
+
+def _render_ai_site_context(
+    classification: str,
+    age_days: int | None,
+    launch_date: str | None,
+    host: str | None,
+    config: ResolvedConfig,
+) -> list[str]:
+    """v1.9: render the site-context block under the AI Crawler Report.
+
+    Called when no AI crawler activity was recorded AND we have enough
+    config context to say something useful. Returns the lines to
+    append; the caller is responsible for placing them under the v1.8
+    "No AI crawler activity recorded." line.
+
+    Wording follows the three absence branches in the v1.9 spec.
+    Empty list when classification is "unknown" (no context to add)
+    or "active" (renderer should not call us in that case).
+    """
+    lines: list[str] = []
+    window_min = config.ai_discovery_window_min_days
+    window_max = config.ai_discovery_window_max_days
+    if classification == "unknown" or classification == "active":
+        return lines
+    if age_days is None or launch_date is None or host is None:
+        # Defensive; classify returns "unknown" in these cases.
+        return lines
+
+    # Pluralisation helper for the age count. "1 day ago" reads better
+    # than "1 days ago".
+    days_word = "day" if age_days == 1 else "days"
+
+    if classification == "too_early":
+        # Project the date at which "revisit and investigate" becomes
+        # appropriate. The natural point is the midpoint of the
+        # window — earlier and the absence is still expected, later
+        # and the site is approaching "overdue". The spec example
+        # uses launch+14 (= (window_min + window_max) / 2) for a
+        # 7-21 window; we generalise to round((min+max)/2).
+        revisit_offset = (window_min + window_max) // 2
+        launch_dt = datetime.strptime(launch_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
+        revisit_date = launch_dt + timedelta(days=revisit_offset)
+        lines.append("")
+        lines.append(
+            f"Site context: {host} launched {age_days} {days_word} ago. "
+            f"AI crawlers typically"
+        )
+        lines.append(
+            f"discover new properties {window_min}–{window_max} days "
+            f"after sitemap submission to"
+        )
+        lines.append(
+            f"search engines. Absence here is expected; revisit after "
+            f"{revisit_date.strftime('%Y-%m-%d')}."
+        )
+    elif classification == "in_window":
+        lines.append("")
+        lines.append(
+            f"Site context: {host} launched {age_days} {days_word} ago, "
+            f"within the typical"
+        )
+        lines.append(
+            f"{window_min}–{window_max}-day AI crawler discovery window. "
+            f"Activity may begin any day."
+        )
+    elif classification == "overdue":
+        lines.append("")
+        lines.append(
+            f"⚠ Site context: {host} launched {age_days} {days_word} ago, "
+            f"past the typical"
+        )
+        lines.append(
+            f"{window_max}-day AI crawler discovery window with no activity. "
+            f"Possible causes:"
+        )
+        lines.append("  - llms.txt not surfacing in search results")
+        lines.append("  - sitemap not yet submitted to relevant search consoles")
+        lines.append("  - robots.txt explicitly disallowing AI crawlers")
+        lines.append(
+            "Verify each before treating absence as a real signal."
+        )
+    return lines
+
+
+def render_ai_crawlers(
+    agg: Aggregate,
+    fmt: str,
+    bot_filter: str,
+    config: ResolvedConfig | None = None,
+) -> str:
     out = [section_header("AI Crawler Report", fmt)]
     if bot_filter != "all" and bot_filter.lower() not in {n.lower() for n in AI_CRAWLERS}:
         out.append(f"Skipped because --bot {bot_filter} filter is active.")
@@ -2077,6 +2390,20 @@ def render_ai_crawlers(agg: Aggregate, fmt: str, bot_filter: str) -> str:
         out.append(f"  404: {nf}, 5xx: {srv}")
     if not seen_any:
         out.append("No AI crawler activity recorded.")
+        # v1.9: emit the site-context block when config provides
+        # enough information. When config is None (caller didn't pass
+        # one — render_ai_crawlers is still callable without v1.9
+        # context for backward compatibility), or the classification
+        # is "unknown" (no host / no launch date), the v1.8 single-line
+        # output is preserved bit-for-bit.
+        if config is not None:
+            classification, age_days, launch_date = (
+                classify_ai_crawler_expectation(agg, config)
+            )
+            context_lines = _render_ai_site_context(
+                classification, age_days, launch_date, agg.host, config
+            )
+            out.extend(context_lines)
         return "\n".join(out) + "\n"
 
     # v1.6: depth-preference subsection. Only renders AI crawlers that
@@ -2306,16 +2633,97 @@ def _format_spoof_ip_paths(observations: list[tuple[str, int]]) -> str:
     return ", ".join(seen)
 
 
+def _compute_framework_opacity(agg: Aggregate) -> tuple[bool, list[tuple[str, int]]]:
+    """v1.9: classify framework-probe responses.
+
+    Returns (opacity, exposed_paths) where:
+      - opacity is True iff every framework probe returned a 4xx status
+        (or there were no probes at all — vacuously opaque)
+      - exposed_paths is a list of (path, status) tuples for any probe
+        that returned 2xx or 3xx. A 3xx is treated as exposure because
+        it confirms the route is being handled rather than 404'd.
+
+    The signal is asymmetric. A handful of 404s on /_next/* confirms
+    the site does not look like a Next.js property to a fingerprinting
+    bot. A single 200 on /_next/static/buildManifest.js means a
+    build-tool manifest is in production — the operator wants that
+    flagged regardless of how many 404s sit alongside it.
+    """
+    exposed: list[tuple[str, int]] = []
+    for path, statuses in agg.framework_probe_status.items():
+        for status, count in statuses.items():
+            if 200 <= status < 400:
+                # Use the most frequent exposed status if there are
+                # multiple; for the common case (single hit) this is
+                # just that status.
+                exposed.append((path, status))
+                break
+    opacity = len(exposed) == 0
+    # Sort exposed by path for deterministic output.
+    exposed.sort()
+    return opacity, exposed
+
+
 def render_framework_probes(agg: Aggregate, fmt: str) -> str:
     if agg.framework_probe_count == 0:
         return ""
     out = [section_header("Framework Fingerprint Probes", fmt)]
-    out.append(f"Total framework probe requests: {agg.framework_probe_count:,}")
+
+    # v1.9: compute opacity. The renderer branches on whether every
+    # probe was rebuffed (positive signal: site cannot be fingerprinted)
+    # or any probe succeeded (warning: build artefact is exposed).
+    opacity, exposed = _compute_framework_opacity(agg)
+
+    # Status-mix summary line. Counts every status across every probe
+    # so the operator sees the actual response distribution rather
+    # than just the path list.
+    status_totals: Counter[int] = Counter()
+    for statuses in agg.framework_probe_status.values():
+        for status, count in statuses.items():
+            status_totals[status] += count
+
+    if opacity:
+        # All-404 is the overwhelmingly common case; format the line
+        # accordingly. Any other 4xx mix gets the more general phrasing.
+        if list(status_totals.keys()) == [404]:
+            out.append(
+                f"{agg.framework_probe_count} framework probe requests, "
+                f"all returning 404."
+            )
+        else:
+            parts = ", ".join(
+                f"{c} × {s}" for s, c in sorted(status_totals.items())
+            )
+            out.append(
+                f"{agg.framework_probe_count} framework probe requests "
+                f"({parts}). All responses were 4xx."
+            )
+        out.append("")
+        out.append("✓ Site is opaque to framework fingerprinting. No build-tool")
+        out.append("  manifests are exposed. Reconnaissance bots that classify sites")
+        out.append("  by stack (Next.js, Nuxt, webpack output) cannot identify this")
+        out.append("  site.")
+    else:
+        # Build the mixed-status summary line.
+        parts = ", ".join(
+            f"{c} × {s}" for s, c in sorted(status_totals.items())
+        )
+        out.append(
+            f"{agg.framework_probe_count} framework probe requests "
+            f"({parts})."
+        )
+        out.append("")
+        out.append("⚠ Build artefact(s) exposed at:")
+        for path, status in exposed:
+            out.append(f"  {path}  ({status})")
+        out.append("")
+        out.append("Static-site generators should not ship build manifests to")
+        out.append("production. Verify the deploy excludes these.")
+
     out.append("")
     out.append("These are bots checking which generator built the site")
-    out.append("(Next.js, Nuxt, webpack, etc). They are 404s on a static Astro")
-    out.append("site, but they are not deploy-window symptoms — they are")
-    out.append("excluded from the content-404 burst detector.")
+    out.append("(Next.js, Nuxt, webpack, etc). They are excluded from the")
+    out.append("content-404 burst detector regardless of response code.")
     out.append("")
     out.append("Top framework probe paths:")
     for path, count in agg.framework_probe_paths.most_common(10):
@@ -2561,7 +2969,8 @@ def render_log_format_recommendation(agg: Aggregate, fmt: str) -> str:
 
 def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None,
                 latency_threshold_ms: int = 1000,
-                post_indexnow_window_hours: int = POST_INDEXNOW_WINDOW_HOURS_DEFAULT) -> str:
+                post_indexnow_window_hours: int = POST_INDEXNOW_WINDOW_HOURS_DEFAULT,
+                config: ResolvedConfig | None = None) -> str:
     score, verdict, reasons = compute_health_score(
         agg, latency_threshold_ms, post_indexnow_window_hours
     )
@@ -2619,6 +3028,11 @@ def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None
         for hour, count in sorted(agg.googlebot_hours.items())
     ]
 
+    # v1.9: compute framework-probe opacity once. The values feed two
+    # JSON keys: framework_probes.opacity (bool) and
+    # framework_probes.exposed_paths (list of {path, status}).
+    fw_opacity, fw_exposed = _compute_framework_opacity(agg)
+
     payload = {
         "summary": summary,
         "bot_breakdown": bot_breakdown,
@@ -2650,6 +3064,15 @@ def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None
         "framework_probes": {
             "total": agg.framework_probe_count,
             "top_paths": agg.framework_probe_paths.most_common(10),
+            # v1.9: opacity + exposed paths. opacity is True iff every
+            # framework probe returned 4xx (or there were none at all);
+            # False iff any probe returned a 2xx/3xx status. The two
+            # keys are additive — v1.8 consumers reading "total" and
+            # "top_paths" continue to work.
+            "opacity": fw_opacity,
+            "exposed_paths": [
+                {"path": p, "status": s} for p, s in fw_exposed
+            ],
         },
         "bad_request_noise": {
             "total": agg.bad_request_count,
@@ -2736,6 +3159,44 @@ def render_json(agg: Aggregate, top_n: int, verification: dict[str, bool] | None
                     key=lambda kv: -len(kv[1]),
                 )[:5]
             ],
+        }
+
+    # v1.9: site metadata. Emitted only when both a host was captured
+    # (seo_crawl format) and the config has a launch_date for that
+    # host. host alone with no launch_date config doesn't justify the
+    # key — the payload's existence implies usable site context.
+    if config is not None and agg.host is not None:
+        site_meta = config.sites.get(agg.host)
+        if site_meta is not None:
+            launch_date = site_meta.get("launch_date")
+            if launch_date is not None:
+                age_days: int | None = None
+                if agg.latest is not None:
+                    age_days = compute_site_age(launch_date, agg.latest)
+                payload["site"] = {
+                    "host": agg.host,
+                    "launch_date": launch_date,
+                    "age_days": age_days,
+                }
+
+    # v1.9: AI crawler discovery-window and derived expectation.
+    # Emitted whenever a config is available — the discovery window
+    # is a configured fact, present whether the operator set it or
+    # the defaults apply. expectation is the classification per
+    # classify_ai_crawler_expectation(). It may resolve to "unknown"
+    # when the host or launch_date isn't available; consumers can
+    # treat "unknown" as equivalent to v1.8 (no expectation signal).
+    if config is not None:
+        classification, _age_days, _launch = (
+            classify_ai_crawler_expectation(agg, config)
+        )
+        payload["ai_crawlers"] = {
+            "discovery_window": {
+                "min": config.ai_discovery_window_min_days,
+                "max": config.ai_discovery_window_max_days,
+                "units": "days",
+            },
+            "expectation": classification,
         }
 
     return json.dumps(payload, indent=2, sort_keys=True, default=str)
@@ -2912,11 +3373,13 @@ def filter_for_bot(agg: Aggregate, bot_filter: str) -> Aggregate:
 
 
 def render_report(agg: Aggregate, args: argparse.Namespace,
-                  verification: dict[str, bool] | None) -> str:
+                  verification: dict[str, bool] | None,
+                  config: ResolvedConfig | None = None) -> str:
     if args.format == "json":
         return render_json(agg, args.top, verification,
                            args.latency_threshold_ms,
-                           args.post_indexnow_window_hours)
+                           args.post_indexnow_window_hours,
+                           config)
 
     fmt = args.format
     parts = [
@@ -2929,7 +3392,11 @@ def render_report(agg: Aggregate, args: argparse.Namespace,
         render_crawler_404s(agg, fmt),
         render_redirects(agg, fmt),
         render_section_breakdown(agg, fmt),
-        render_ai_crawlers(agg, fmt, args.bot),
+        # v1.9: render_ai_crawlers takes the resolved config so the
+        # "no AI crawler activity" branch can render site-context
+        # (launched N days ago, expected/in-window/overdue). When
+        # config is None it falls back to v1.8 wording.
+        render_ai_crawlers(agg, fmt, args.bot, config),
         render_deploy_anomalies(agg, fmt),
         render_health_score(agg, fmt, args.latency_threshold_ms,
                             args.post_indexnow_window_hours),
@@ -2955,6 +3422,17 @@ def render_report(agg: Aggregate, args: argparse.Namespace,
 
 
 def main(argv: list[str] | None = None) -> int:
+    # v1.9: runtime version floor. The analyser uses stdlib tomllib,
+    # which landed in 3.11. An older interpreter would crash with an
+    # opaque ModuleNotFoundError partway through load_config(); the
+    # explicit exit message tells the operator exactly what's wrong
+    # and what to do about it.
+    if sys.version_info < (3, 11):
+        sys.exit(
+            "crawler-log-analyser requires Python 3.11+ (stdlib tomllib). "
+            f"Found Python {sys.version_info.major}.{sys.version_info.minor}."
+        )
+
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
     # v1.8: resolve config file before anything else so --show-config can
@@ -3027,7 +3505,7 @@ def main(argv: list[str] | None = None) -> int:
         gb_ips = agg.bot_ips.get("Googlebot", set())
         verification = verify_googlebot_ips(gb_ips)
 
-    output = render_report(agg, args, verification)
+    output = render_report(agg, args, verification, config)
 
     if args.output:
         Path(args.output).write_text(output, encoding="utf-8")

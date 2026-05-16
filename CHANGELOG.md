@@ -7,6 +7,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.9.0] — 2026-05-15
+
+Three "explained absence" features. v1.8 reports correctly flagged the
+absence of AI crawler activity, framework-probe responses, and per-site
+context, but treated each absence as a bare count or a silent gap.
+v1.9 turns each into a classified, contextual signal — now that
+multi-site data (one mature property, one one-day-old) exists to
+calibrate against.
+
+### Added
+
+- **[sites."<hostname>"] config table.** Per-site metadata keyed by the
+  `$host` field captured in the seo_crawl log format. Currently carries
+  `launch_date` (ISO 8601); the shape is open for future per-site keys
+  (latency thresholds, expected traffic floors) without a schema
+  rewrite. The analyser reads the host from the first log entry and
+  looks up the matching table.
+- **[ai_crawlers] config table** with `expected_discovery_window_days_min`
+  and `expected_discovery_window_days_max` (defaults 7 and 21). Both
+  bounds validated against `[1, 365]`; `min > max` reverts to defaults
+  with a warning.
+- **AI Crawler Report site-context block.** When no AI crawler activity
+  is recorded *and* a launch date is configured, the report classifies
+  the absence as one of:
+    - `too_early` — site age < window_min; absence expected, revisit-after
+      date computed as `launch + (min+max)//2`
+    - `in_window` — `window_min ≤ age ≤ window_max`; activity may begin
+      any day
+    - `overdue` — age > window_max; absence worth investigating, with a
+      three-line diagnostic checklist (llms.txt indexing, search-console
+      submission, robots.txt restrictions)
+    - `active` — at least one AI crawler hit the site; v1.8 wording
+      preserved verbatim
+  When the launch date isn't configured (or the log is combined-format
+  with no host field), classification falls through to `unknown` and the
+  v1.8 single-line wording is preserved.
+- **Framework Fingerprint Probes opacity signal.** When every framework
+  probe returns a 4xx (the static-site case), the section now reads:
+    > ✓ Site is opaque to framework fingerprinting. No build-tool
+    >   manifests are exposed.
+  When any probe returns 2xx or 3xx, the wording flips to a warning
+  listing the exposed paths and statuses. The underlying probe path
+  list is unchanged.
+- **`--show-config` output extended** with `Sites configured:` and `AI
+  crawler discovery window:` sections so the operator can verify the
+  v1.9 surfaces parsed cleanly without running a full report.
+- **JSON output additions** (additive — no existing keys changed shape):
+    - `site.{host, launch_date, age_days}` — emitted when launch date
+      is configured for the captured host
+    - `ai_crawlers.discovery_window.{min, max, units}` — emitted whenever
+      a config is in play
+    - `ai_crawlers.expectation` — one of the five classifications above
+    - `framework_probes.opacity` (bool) and `framework_probes.exposed_paths`
+      (list of `{path, status}`) — emitted whenever framework probes
+      are detected
+- **`compute_site_age(launch_date, reference)` helper.** UTC date-based;
+  clamps future-dated launches to 0 rather than returning negative.
+- **`classify_ai_crawler_expectation(agg, config)` helper.** Returns
+  `(classification, age_days, launch_date)`. Pure function over the
+  Aggregate and ResolvedConfig — easy to unit-test in isolation.
+- **28-test unit suite** (`test_v19.py`) covering classification
+  boundaries, opacity branching, age computation around UTC midnight,
+  and seven bad-config validation paths (malformed dates, inverted
+  windows, out-of-range values, unknown subkeys, boolean-as-integer).
+
+### Changed
+
+- **Python version floor raised to 3.11.** Hard requirement, checked at
+  the top of `main()` with a clear exit message. The previous 3.8–3.10
+  fallback TOML parser surface is removed.
+- **Framework probe section wording** generalised from "they are 404s
+  on a static Astro site" (always true in v1.8) to "they are excluded
+  from the content-404 burst detector regardless of response code"
+  (true for both the opacity and exposure cases).
+- **Aggregate dataclass** gains `host: str | None` (captured from the
+  first seo_crawl log entry) and `framework_probe_status:
+  dict[str, Counter[int]]` (per-path status tally, populated alongside
+  the existing `framework_probe_paths` for backward compatibility).
+- **ResolvedConfig dataclass** gains `sites`, `ai_discovery_window_min_days`,
+  and `ai_discovery_window_max_days` fields.
+
+### Removed
+
+- **`_parse_toml_subset()` and `_toml_subset_resolve_section()`** — the
+  Python 3.8–3.10 fallback TOML parser, ~210 lines. Net effect: the
+  analyser now uses stdlib `tomllib` exclusively, removing the
+  subset-of-features caveat and any divergence risk between the
+  two parser paths.
+- **`try/except ImportError` branching in `load_config()`** — now a
+  direct `import tomllib`.
+
+### Migration notes
+
+Operators running v1.8 on Python 3.8–3.10 will hit a clean exit message
+on first invocation directing them to upgrade. Config files written
+for v1.8 (the `ignore_source_ips` key) parse unchanged under v1.9.
+
+To enable the new v1.9 features, append to `~/.config/crawler-log-analyser/config.toml`:
+
+```toml
+[sites."<your-hostname>"]
+launch_date = "YYYY-MM-DD"
+
+[ai_crawlers]
+expected_discovery_window_days_min = 7
+expected_discovery_window_days_max = 21
+```
+
+Verify with `crawler_log_analyser.py --show-config` before running a
+full report.
+
+### Validated against
+
+Live production logs for axilog.io (launched 2026-05-14, in IndexNow
+post-launch crawl window) and speytech.com (launched 2026-01-25,
+mature steady-state with active AI crawler cohort). Both reports
+read cleanly: axilog produces "Site context: axilog.io launched 1
+day ago … revisit after 2026-05-28"; speytech preserves the v1.8
+wording for the active branch unchanged.
+
 ## v1.8.0 — 2026-05-14
 
 One operational improvement deferred from the v1.7 requirements list:
