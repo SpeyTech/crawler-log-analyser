@@ -140,4 +140,4 @@ Licensed under AGPL-3.0-or-later. Commercial use, internal modification, and int
 
 ## Status
 
-v1.10.2. Tested against production nginx logs on `speytech.com` and `axilog.io`, including production crawler traffic from Googlebot, Bingbot, OAI-SearchBot, ClaudeBot, GPTBot, ChatGPT-User, PerplexityBot, Applebot, YandexBot, and others. PRs are welcome; review may be slow as the project is maintained as time permits.
+v1.10.2. Tested against production nginx logs on `speytech.com` and `axilog.io`, including production crawler traffic from Googlebot, Bingbot, OAI-SearchBot, ClaudeBot, GPTBot, ChatGPT-User, PerplexityBot, Applebot, YandexBot, and others. **Feature-frozen through 31 August 2026 — see [`docs/FEATURE-FREEZE.md`](docs/FEATURE-FREEZE.md).** PRs are welcome; review may be slow as the project is maintained as time permits.
